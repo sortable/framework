@@ -2147,7 +2147,6 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             partialUpdate(JsCmds.JsTry(JsRaw(toCall+"("+s+")").cmd, false))
           }
           case x: AnyRef => {
-            println("Hey we got the message "+x)
             import json._
             implicit val formats = Serialization.formats(NoTypeHints)
 
