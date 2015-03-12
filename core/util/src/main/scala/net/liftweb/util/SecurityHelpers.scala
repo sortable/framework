@@ -17,12 +17,21 @@
 package net.liftweb
 package util
 
+import javax.xml.XMLConstants
+import javax.xml.parsers.SAXParserFactory
+import javax.xml.transform.stream.StreamSource
+import javax.xml.validation.SchemaFactory
+
 import org.apache.commons.codec.binary.Base64
-import java.io.{InputStream, ByteArrayOutputStream, ByteArrayInputStream, Reader, File, FileInputStream, BufferedReader}
-import java.security.{SecureRandom, MessageDigest}
+import java.io._
+import java.security._
 import javax.crypto._
 import javax.crypto.spec._
-import scala.xml.{Node, XML}
+import org.xml.sax.{EntityResolver, InputSource, ErrorHandler}
+import org.xml.sax.helpers.DefaultHandler
+
+import scala.xml.parsing.NoBindingFactoryAdapter
+import scala.xml.{TopScope, Elem, Node, XML}
 import common._
 
 object SecurityHelpers extends StringHelpers with IoHelpers with SecurityHelpers
@@ -75,23 +84,23 @@ trait SecurityHelpers {
   def md5(in: String): String = base64Encode(md5(in.getBytes("UTF-8")))
 
   /** create a SHA hash from a Byte array */
-  def hash(in : Array[Byte]) : Array[Byte] = {
+  def hash(in: Array[Byte]): Array[Byte] = {
     MessageDigest.getInstance("SHA").digest(in)
   }
 
   /** create a SHA hash from a String */
-  def hash(in: String) : String = {
+  def hash(in: String): String = {
     base64Encode(MessageDigest.getInstance("SHA").digest(in.getBytes("UTF-8")))
   }
 
-   /** create a SHA hash from a String */
-  def hashHex(in: String) : String = {
+  /** create a SHA hash from a String */
+  def hashHex(in: String): String = {
     Helpers.hexEncode(MessageDigest.getInstance("SHA").digest(in.getBytes("UTF-8")))
   }
 
   /** Compare two strings in a way that does not vary if the strings
-   * are determined to be not equal early (test every byte... avoids
-   * timing attackes */
+    * are determined to be not equal early (test every byte... avoids
+    * timing attackes */
   def secureEquals(s1: String, s2: String): Boolean = (s1, s2) match {
     case (null, null) => true
     case (null, _) => false
@@ -100,8 +109,8 @@ trait SecurityHelpers {
   }
 
   /** Compare two byte arrays in a way that does not vary if the arrays
-   * are determined to be not equal early (test every byte... avoids
-   * timing attackes */
+    * are determined to be not equal early (test every byte... avoids
+    * timing attackes */
   def secureEquals(s1: Array[Byte], s2: Array[Byte]): Boolean = (s1, s2) match {
     case (null, null) => true
     case (null, _) => false
@@ -121,12 +130,12 @@ trait SecurityHelpers {
 
 
   /** create a SHA-256 hash from a Byte array */
-  def hash256(in : Array[Byte]) : Array[Byte] = {
+  def hash256(in: Array[Byte]): Array[Byte] = {
     MessageDigest.getInstance("SHA-256").digest(in)
   }
 
   /** create a SHA-256 hash from a String */
-  def hash256(in : String): String = {
+  def hash256(in: String): String = {
     base64Encode(MessageDigest.getInstance("SHA-256").digest(in.getBytes("UTF-8")))
   }
 
@@ -164,7 +173,7 @@ trait SecurityHelpers {
       case 'd' | 'D' => 13
       case 'e' | 'E' => 14
       case 'f' | 'F' => 15
-        case _ => 0
+      case _ => 0
     }
 
     while (pos < max) {
@@ -197,5 +206,34 @@ trait SecurityHelpers {
     sb.toString
   }
 
+  def secureParseXML(in: String): Elem = secureParseXML(new StringReader(in))
+
+  def secureParseXML(in: Reader): Elem = {
+    val spf = SAXParserFactory.newInstance()
+    val saxParser = spf.newSAXParser();
+    val is = new InputSource(in);
+    val newAdapter = new SecureFactoryAdaptor
+    newAdapter.scopeStack.push( TopScope)
+
+    saxParser.parse(is, newAdapter)
+
+    newAdapter.scopeStack.pop
+    newAdapter.rootElem.asInstanceOf[Elem]
+  }
+
+  def secureParseXML(in: InputStream): Elem = secureParseXML(new InputStreamReader(in, "UTF-8"))
+
+
+  def tryIt = secureParseXML("""<?xml version="1.0" encoding="ISO-8859-1"?>
+ <!DOCTYPE foo [
+   <!ELEMENT foo ANY >
+   <!ENTITY xxe SYSTEM "file:///etc/passwd" >]><foo>&xxe;</foo>""")
+
 }
 
+private class SecureFactoryAdaptor extends NoBindingFactoryAdapter {
+  override def resolveEntity(publicId: String, systemId: String): InputSource = {
+    throw new SecurityException("Attempt to access an entity "+publicId+" / "+systemId)
+
+  }
+}
