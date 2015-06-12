@@ -27,10 +27,9 @@ import actor.LAFuture
 import util._
 import Helpers._
 import js._
-
-import builtin.snippet._
 import provider._
 import http.rest.RestContinuation
+
 
 class SJBridge {
   def s = S
@@ -128,8 +127,7 @@ object S extends S {
   /**
    *  Impersonates a function that will be called when uploading files
    */
-  @serializable
-  private final class BinFuncHolder(val func: FileParamHolder => Any, val owner: Box[String]) extends AFuncHolder {
+  private final class BinFuncHolder(val func: FileParamHolder => Any, val owner: Box[String]) extends AFuncHolder with Serializable{
     def apply(in: List[String]) {logger.info("You attempted to call a 'File Upload' function with a normal parameter.  Did you forget to 'enctype' to 'multipart/form-data'?")}
 
     override def apply(in: FileParamHolder) = func(in)
@@ -153,8 +151,7 @@ object S extends S {
    * Impersonates a function that is executed on HTTP requests from client. The function
    * takes a String as the only parameter and returns an Any.
    */
-  @serializable
-  private final class SFuncHolder(val func: String => Any, val owner: Box[String]) extends AFuncHolder {
+  private final class SFuncHolder(val func: String => Any, val owner: Box[String]) extends AFuncHolder with Serializable{
     def this(func: String => Any) = this (func, Empty)
 
     def apply(in: List[String]): Any = in.headOption.toList.map(func(_))
@@ -170,8 +167,7 @@ object S extends S {
    * Impersonates a function that is executed on HTTP requests from client. The function
    * takes a List[String] as the only parameter and returns an Any.
    */
-  @serializable
-  private final class LFuncHolder(val func: List[String] => Any, val owner: Box[String]) extends AFuncHolder {
+  private final class LFuncHolder(val func: List[String] => Any, val owner: Box[String]) extends AFuncHolder with Serializable {
     def apply(in: List[String]): Any = func(in)
   }
 
@@ -185,16 +181,14 @@ object S extends S {
    * Impersonates a function that is executed on HTTP requests from client. The function
    * takes zero arguments and returns an Any.
    */
-  @serializable
-  private final class NFuncHolder(val func: () => Any, val owner: Box[String]) extends AFuncHolder {
+  private final class NFuncHolder(val func: () => Any, val owner: Box[String]) extends AFuncHolder with Serializable{
     def apply(in: List[String]): Any = in.headOption.toList.map(s => func())
   }
 
   /**
    * Abstrats a function that is executed on HTTP requests from client.
    */
-  @serializable
-  sealed trait AFuncHolder extends Function1[List[String], Any] {
+  sealed trait AFuncHolder extends Function1[List[String], Any] with Serializable{
     def owner: Box[String]
 
     def apply(in: List[String]): Any
@@ -216,6 +210,24 @@ object S extends S {
     def sessionLife: Boolean = _sessionLife
 
     private[this] val _sessionLife: Boolean = functionLifespan_?
+  }
+
+  /**
+   * We create one of these dudes and put it
+   */
+  private[http] final case class PageStateHolder(owner: Box[String], session: LiftSession) extends AFuncHolder {
+    private val loc = S.location
+    private val snapshot:  Function1[Function0[Any], Any] = RequestVarHandler.generateSnapshotRestorer()
+    override def sessionLife: Boolean = false
+
+    def apply(in: List[String]): Any = {
+      error("You shouldn't really be calling apply on this dude...")
+    }
+
+    def runInContext[T](f: => T): T = {
+      val ret = snapshot(() => f).asInstanceOf[T]
+      ret
+    }
   }
 
   /**
@@ -320,6 +332,9 @@ trait S extends HasParams with Loggable {
   private val autoCleanUp = new ThreadGlobal[Boolean]
   private val _oneShot = new ThreadGlobal[Boolean]
   private val _disableTestFuncNames = new ThreadGlobal[Boolean]
+  private object _originalRequest extends RequestVar[Box[Req]](Empty)
+
+  private object _exceptionThrown extends TransientRequestVar(false)
 
   private object postFuncs extends TransientRequestVar(new ListBuffer[() => Unit])
 
@@ -335,6 +350,8 @@ trait S extends HasParams with Loggable {
    */
   private object _jsToAppend extends TransientRequestVar(new ListBuffer[JsCmd])
 
+  private object _globalJsToAppend extends TransientRequestVar(new ListBuffer[JsCmd])
+
   /**
    * We can now collect Elems to put in the head tag
    */
@@ -344,7 +361,7 @@ trait S extends HasParams with Loggable {
    * We can now collect Elems to put at the end of the body
    */
   private object _tailTags extends TransientRequestVar(new ListBuffer[Elem])
-  
+
   private object p_queryLog extends TransientRequestVar(new ListBuffer[(String, Long)])
   private object p_notice extends TransientRequestVar(new ListBuffer[(NoticeType.Value, NodeSeq, Box[String])])
 
@@ -363,9 +380,33 @@ trait S extends HasParams with Loggable {
    */
   def request: Box[Req] = (Box !! _request.value) or CurrentReq.box
 
+
+  /**
+   * If this is an Ajax request, return the original request that created the page. The original
+   * request is useful because it has the original path which is helpful for localization purposes.
+   *
+   * @return the original request or if that's not available, the current request
+   */
+  def originalRequest: Box[Req] = _originalRequest.get or request
+
   private[http] object CurrentLocation extends RequestVar[Box[sitemap.Loc[_]]](request.flatMap(_.location))
 
-  def location: Box[sitemap.Loc[_]] = CurrentLocation.is
+  def location: Box[sitemap.Loc[_]] = CurrentLocation.is or {
+    //try again in case CurrentLocation was accessed before the request was available
+    request flatMap { r => CurrentLocation(r.location) }
+  }
+
+
+  /**
+   * An exception was thrown during the processing of this request.
+   * This is tested to see if the transaction should be rolled back
+   */
+  def assertExceptionThrown() {_exceptionThrown.set(true)}
+
+  /**
+   * Was an exception thrown during the processing of the current request?
+   */
+  def exceptionThrown_? : Boolean = _exceptionThrown.get
 
   /**
    * @return a List of any Cookies that have been set for this Response. If you want
@@ -541,7 +582,7 @@ trait S extends HasParams with Loggable {
    * Get the current instance of HtmlProperties
    */
   def htmlProperties: HtmlProperties = {
-    session.map(_.requestHtmlProperties.is) openOr 
+    session.map(_.requestHtmlProperties.is) openOr
     LiftRules.htmlProperties.vend(
       S.request openOr Req.nil
     )
@@ -751,8 +792,11 @@ trait S extends HasParams with Loggable {
    * Sometimes it's helpful to accumute JavaScript as part of servicing
    * a request.  For example, you may want to accumulate the JavaScript
    * as part of an Ajax response or a Comet Rendering or
-   * as part of a regular HTML rendering.  Call S.appendJs(jsCmd).
-   * The accumulation of Js will be emitted as part of the response.
+   * as part of a regular HTML rendering.  Call `S.appendJs(jsCmd)`.
+   * The accumulated Javascript will be emitted as part of the response,
+   * wrapped in an `OnLoad` to ensure that it executes after
+   * the entire dom is available. If for some reason you need to run
+   * javascript at the top-level scope, use appendGlobalJs.
    */
   def appendJs(js: JsCmd): Unit = _jsToAppend.is += js
 
@@ -760,10 +804,24 @@ trait S extends HasParams with Loggable {
    * Sometimes it's helpful to accumute JavaScript as part of servicing
    * a request.  For example, you may want to accumulate the JavaScript
    * as part of an Ajax response or a Comet Rendering or
-   * as part of a regular HTML rendering.  Call S.appendJs(jsCmd).
-   * The accumulation of Js will be emitted as part of the response.
+   * as part of a regular HTML rendering.  Call `S.appendJs(jsCmd)`.
+   * The accumulated Javascript will be emitted as part of the response,
+   * wrapped in an `OnLoad` to ensure that it executes after
+   * the entire dom is available. If for some reason you need to run
+   * javascript at the top-level scope, use `appendGlobalJs`.
    */
   def appendJs(js: Seq[JsCmd]): Unit = _jsToAppend.is ++= js
+
+  /**
+   * Add javascript to the page rendering that
+   * will execute in the global scope.
+   * Usually you should use `appendJs`, so that the javascript
+   * runs after the entire dom is available. If you need to
+   * declare a global var or you want javascript to execute
+   * immediately with no guarantee that the entire dom is available,
+   * you may use `appendGlobalJs`.
+   */
+  def appendGlobalJs(js: JsCmd*): Unit = _globalJsToAppend.is ++= js
 
   /**
    * Get the accumulated JavaScript
@@ -772,17 +830,18 @@ trait S extends HasParams with Loggable {
    */
   def jsToAppend(): List[JsCmd] = {
     import js.JsCmds._
-    (for {
-      sess <- S.session
-    } yield sess.postPageJavaScript(RenderVersion.get :: 
-                                    S.currentCometActor.
-                                    map(_.uniqueId).toList)) match {
-      case Full(xs) if !xs.isEmpty => List(OnLoad(_jsToAppend.is.toList ::: xs))
-      case _ => _jsToAppend.is.toList match {
-        case Nil => Nil
-        case xs => List(OnLoad(xs))
+    _globalJsToAppend.is.toList ::: (
+      S.session.map( sess =>
+        sess.postPageJavaScript(RenderVersion.get ::
+                                S.currentCometActor.map(_.uniqueId).toList)
+      ) match {
+        case Full(xs) if !xs.isEmpty => List(OnLoad(_jsToAppend.is.toList ::: xs))
+        case _ => _jsToAppend.is.toList match {
+          case Nil => Nil
+          case xs => List(OnLoad(xs))
+        }
       }
-    }
+    )
   }
 
   /**
@@ -845,7 +904,7 @@ trait S extends HasParams with Loggable {
    */
   def loc(str: String, dflt: NodeSeq): NodeSeq = loc(str).openOr(dflt)
 
-  
+
   /**
    * Localize the incoming string based on a resource bundle for the current locale. The
    * localized string is converted to an XML element if necessary via the <code>LiftRules.localizeStringToXml</code>
@@ -871,11 +930,13 @@ trait S extends HasParams with Loggable {
   /**
    * Get a List of the resource bundles for the current locale. The resource bundles are defined by
    * the LiftRules.resourceNames and LiftRules.resourceBundleFactories variables.
+   * If you do not define an entry for a particular key, we fall back to using
+   * Lift's core entries.
    *
    * @see LiftRules.resourceNames
    * @see LiftRules.resourceBundleFactories
    */
-  def resourceBundles: List[ResourceBundle] = resourceBundles(locale)
+  def resourceBundles: List[ResourceBundle] = resourceBundles(locale) ++ liftCoreResourceBundle.toList
 
   def resourceBundles(loc: Locale): List[ResourceBundle] = {
     _resBundle.box match {
@@ -916,8 +977,13 @@ trait S extends HasParams with Loggable {
    */
   def liftCoreResourceBundle: Box[ResourceBundle] = _liftCoreResBundle.is
 
+
+  private object resourceValueCache extends TransientRequestMemoize[(String, Locale), String]
+  
   /**
    * Get a localized string or return the original string.
+   * We first try your own bundle resources, if that fails, we try
+   * Lift's core bundle.
    *
    * @param str the string to localize
    *
@@ -925,10 +991,12 @@ trait S extends HasParams with Loggable {
    *
    * @see # resourceBundles
    */
-  def ?(str: String): String = ?!(str, resourceBundles)
+  def ?(str: String): String = resourceValueCache.get(str -> locale, ?!(str, resourceBundles))
 
   /**
    * Get a localized string or return the original string.
+   * We first try your own bundle resources, if that fails, we try
+   * Lift's core bundle.
    *
    * @param str the string to localize
    *
@@ -938,10 +1006,13 @@ trait S extends HasParams with Loggable {
    *
    * @see # resourceBundles
    */
-  def ?(str: String, locale: Locale): String = ?!(str, resourceBundles(locale))
+  def ?(str: String, locale: Locale): String = resourceValueCache.get(str -> locale, ?!(str, resourceBundles(locale)))
+  
   /**
    * Attempt to localize and then format the given string. This uses the String.format method
    * to format the localized string.
+   * We first try your own bundle resources, if that fails, we try
+   * Lift's core bundle.
    *
    * @param str the string to localize
    * @param params the var-arg parameters applied for string formatting
@@ -964,7 +1035,8 @@ trait S extends HasParams with Loggable {
    *
    * @return the localized version of the string
    */
-  def ??(str: String): String = ?!(str, liftCoreResourceBundle.toList)
+  @deprecated("Use S.?() instead. S.?? will be removed in 2.6", "2.5")
+  def ??(str: String): String = ?(str)
 
   /**
    * Get a core lift localized and formatted string or return the original string.
@@ -974,7 +1046,8 @@ trait S extends HasParams with Loggable {
    *
    * @return the localized version of the string
    */
-  def ??(str: String, params: AnyRef*): String = String.format(locale, ??(str), params: _*)
+  @deprecated("Use S.?() instead. S.?? will be removed in 2.6", "2.5")
+  def ??(str: String, params: AnyRef*): String = String.format(locale, ?(str), params: _*)
 
   private def ?!(str: String, resBundle: List[ResourceBundle]): String = resBundle.flatMap(r => tryo(r.getObject(str) match {
     case s: String => Full(s)
@@ -998,7 +1071,7 @@ trait S extends HasParams with Loggable {
   /**
    * Returns the logical page_id of the current request. All RequestVars for a current page share this id.
    */
-  def renderVersion = RenderVersion.get
+  def renderVersion: String = RenderVersion.get
 
   /**
    * The URI of the current request (not re-written). The URI is the portion of the request
@@ -1040,20 +1113,31 @@ trait S extends HasParams with Loggable {
    */
   def uri: String = request.map(_.uri).openOr("/")
 
-/**
-* Returns the query string for the current request
-*/
-def queryString: Box[String] =
-for {
-  req <- request
-  queryString <- req.request.queryString
-} yield queryString
+  /**
+   * Returns the query string for the current request
+   */
+  def queryString: Box[String] = for {
+    req <- request
+    queryString <- req.request.queryString
+  } yield queryString
+    
+    
+  def uriAndQueryString: Box[String] = for {
+    req <- this.request
+  } yield req.uri + (queryString.map(s => "?"+s) openOr "")
 
-
-def uriAndQueryString: Box[String] =
-for {
-  req <- this.request
-} yield req.uri + (queryString.map(s => "?"+s) openOr "")
+  /**
+   * Run any configured exception handlers and make sure errors in
+   * the handlers are ignored
+   */
+  def runExceptionHandlers(req: Req, orig: Throwable): Box[LiftResponse] = {
+    S.assertExceptionThrown() 
+    tryo{(t: Throwable) => 
+      logger.error("An error occurred while running error handlers", t)
+      logger.error("Original error causing error handlers to be run", orig)} {
+      NamedPF.applyBox((Props.mode, req, orig), LiftRules.exceptionHandler.toList);
+    } openOr Full(PlainTextResponse("An error has occurred while processing an error using the functions in LiftRules.exceptionHandler. Check the log for details.", 500))
+  }
 
   private object _skipXmlHeader extends TransientRequestVar(false)
 
@@ -1185,12 +1269,12 @@ for {
   def init[B](request: Req, session: LiftSession)(f: => B): B = {
     if (inS.value) f
     else {
-      if (request.stateless_?) 
+      if (request.stateless_?)
         session.doAsStateless(_init(request, session)(() => f))
       else _init(request, session)(() => f)
     }
   }
-  
+
   def statelessInit[B](request: Req)(f: => B): B = {
     session match {
       case Full(s) if s.stateful_? => {
@@ -1198,13 +1282,13 @@ for {
           "Attempt to initialize a stateless session within the context "+
           "of a stateful session")
       }
-      
+
       case Full(_) => f
 
       case _ => {
         val fakeSess = LiftRules.statelessSession.vend.apply(request)
         try {
-          _init(request, 
+          _init(request,
                 fakeSess)(() => f)
         } finally {
           // ActorPing.schedule(() => fakeSess.doShutDown(), 0 seconds)
@@ -1398,17 +1482,30 @@ for {
               rh.headers = rh.headers + (name -> value)
       )
   }
+  /**
+   * Synonym for S.setHeader. Exists to provide the converse to
+   * S.getResponseHeader.
+   */
+  def setResponseHeader(name: String, value: String) {
+    setHeader(name, value)
+  }
 
+
+  @deprecated("Use S.getResponseHeaders instead for clarity.", "2.5")
+  def getHeaders(in: List[(String, String)]): List[(String, String)] = {
+    getResponseHeaders(in)
+  }
   /**
    * Returns the currently set HTTP response headers as a List[(String, String)]. To retrieve
-   * a specific response header, use S.getHeader. If you want to get request headers (those
-   * sent by the client), use Req.getHeaders or S.getRequestHeader.
+   * a specific response header, use S.getResponseHeader. If you want to
+   * get request headers (those sent by the client), use Req.getHeaders
+   * or S.getRequestHeader.
    *
    * @see # setHeader ( String, String )
-   * @see # getHeader ( String )
+   * @see # getResponseHeader ( String )
    * @see # getRequestHeader ( String )
    */
-  def getHeaders(in: List[(String, String)]): List[(String, String)] = {
+  def getResponseHeaders(in: List[(String, String)]): List[(String, String)] = {
     Box.legacyNullTest(_responseHeaders.value).map(
       rh =>
               rh.headers.iterator.toList :::
@@ -1416,6 +1513,10 @@ for {
       ).openOr(Nil)
   }
 
+  @deprecated("Use S.getResponseHeader instead for clarity.", "2.5")
+  def getHeader(name: String): Box[String] = {
+    getResponseHeader(name)
+  }
   /**
    * Returns the current set value of the given HTTP response header as a Box. If
    * you want a request header, use Req.getHeader or S.getRequestHeader.
@@ -1424,10 +1525,10 @@ for {
    * @return A Full(value) or Empty if the header isn't set
    *
    * @see # setHeader ( String, String )
-   * @see # getHeaders ( List[ ( String, String ) ] )
+   * @see # getResponseHeaders ( List[ ( String, String ) ] )
    * @see # getRequestHeader ( String )
    */
-  def getHeader(name: String): Box[String] = {
+  def getResponseHeader(name: String): Box[String] = {
     Box.legacyNullTest(_responseHeaders.value).map(
       rh => Box(rh.headers.get(name))
       ).openOr(Empty)
@@ -1526,11 +1627,11 @@ for {
             session match {
               case Full(s) if s.stateful_? =>
                 LiftRules.earlyInStateful.toList.foreach(_(req))
-              
-              case Full(s) => 
+
+              case Full(s) =>
                 LiftRules.earlyInStateless.toList.foreach(_(req))
 
-              case _ => 
+              case _ =>
             }
             f
           }
@@ -1544,10 +1645,10 @@ for {
   private def doStatefulRewrite(old: Req): Req = {
     // Don't even try to rewrite Req.nil
     if (statefulRequest_? &&
-        !old.path.partPath.isEmpty && 
+        !old.path.partPath.isEmpty &&
         (old.request ne null))
-      Req(old, S.sessionRewriter.map(_.rewrite) ::: 
-          LiftRules.statefulRewrite.toList, LiftRules.statelessTest.toList,
+      Req(old, S.sessionRewriter.map(_.rewrite) :::
+          LiftRules.statefulRewrite.toList, Nil,
       LiftRules.statelessReqTest.toList)
     else old
   }
@@ -1557,7 +1658,11 @@ for {
       _attrs.doWith((Null,Nil)) {
           _resBundle.doWith(Nil) {
             inS.doWith(true) {
-              withReq(doStatefulRewrite(request)) {
+              val statefulRequest = doStatefulRewrite(request)
+              withReq(statefulRequest) {
+                // set the request for standard requests
+                if (statefulRequest.standardRequest_?) _originalRequest.set(Full(statefulRequest))
+
                 _nest2InnerInit(f)
               }
           }
@@ -1940,13 +2045,27 @@ for {
      * Returns the unprefixed attribute value as an Option[NodeSeq]
      * for easy addition to the attributes
      */
-    def ~(key: String): Option[NodeSeq] = apply(key).toOption.map(Text)
+    def ~(key: String): Option[NodeSeq] = apply(key).toOption.map(Text(_))
 
     /**
      * Returns the prefixed attribute value as an Option[NodeSeq]
      * for easy addition to the attributes
      */
-    def ~(prefix: String, key: String): Option[NodeSeq] = apply(prefix, key).toOption.map(Text)
+    def ~(prefix: String, key: String): Option[NodeSeq] = apply(prefix, key).toOption.map(Text(_))
+  }
+
+  /**
+   * Sometimes, in the course of eager evaluation, it becomes necessary
+   * to clear attribtues so they do not polute the eagerly evaluated stuff.
+   * When you need to clear the attributes, wrap your code block in clearAttrs
+   * and have fun.
+   *
+   * @param f the call-by-name code block to run where the attributes are clear
+   * @tparam T the return type of the code block
+   * @return the return value of the code block
+   */
+  def clearAttrs[T](f: => T):T = {
+    _attrs.doWith((Null, Nil))(f)
   }
 
   /**
@@ -1954,7 +2073,7 @@ for {
    *
    * @param attr The attributes to set temporarily
    */
-  @deprecated("Use the S.withAttrs method instead")
+  @deprecated("Use the S.withAttrs method instead", "2.4")
   def setVars[T](attr: MetaData)(f: => T): T = withAttrs(attr)(f)
 
   /**
@@ -1984,7 +2103,7 @@ for {
   /**
    * Retrieves the attributes from the most recently executed
    * snippet element.
-   * 
+   *
    * For example, given the snippets:
    *
    * <pre name="code" class="xml">
@@ -2065,13 +2184,13 @@ for {
      * Returns the unprefixed attribute value as an Option[NodeSeq]
      * for easy addition to the attributes
      */
-    def ~(key: String): Option[NodeSeq] = apply(key).toOption.map(Text)
+    def ~(key: String): Option[NodeSeq] = apply(key).toOption.map(Text(_))
 
     /**
      * Returns the prefixed attribute value as an Option[NodeSeq]
      * for easy addition to the attributes
      */
-    def ~(prefix: String, key: String): Option[NodeSeq] = apply(prefix, key).toOption.map(Text)
+    def ~(prefix: String, key: String): Option[NodeSeq] = apply(prefix, key).toOption.map(Text(_))
   }
 
   /**
@@ -2219,6 +2338,52 @@ for {
     NamedPF.applyBox(snippet, LiftRules.snippets.toList)
   }
 
+
+  private object _currentSnippetNodeSeq extends ThreadGlobal[NodeSeq]
+
+  /**
+   * The code block is executed while setting the current raw NodeSeq
+   * for access elsewhere
+   *
+   * @param ns the current NodeSeq
+   * @param f the call-by-name value to return (the code block to execute)
+   * @tparam T the type that f returns
+   * @return the value the the expression returns
+   */
+  def withCurrentSnippetNodeSeq[T](ns: NodeSeq)(f: => T): T =
+  _currentSnippetNodeSeq.doWith(ns)(f)
+
+  /**
+   * The current raw NodeSeq that resulted in a snippet invocation
+   * @return The current raw NodeSeq that resulted in a snippet invocation
+   */
+  def currentSnippetNodeSeq: Box[NodeSeq] = _currentSnippetNodeSeq.box
+
+  private object _ignoreFailedSnippets extends ThreadGlobal[Boolean]
+
+  /**
+   * Set the ignore snippet error mode.  In this mode, any
+   * snippet failures (usually snippets not being invocable) will be
+   * ignored and the original NodeSeq will be returned.
+   *
+   * This is useful if you want to do an initial pass of a page with a white-list
+   * of snippets, but not run every snippet on the page.
+   *
+   * @param ignore sets the ignore flag
+   * @param f the code block to execute
+   * @tparam T the return type of the code block
+   * @return the return of the code block
+   */
+  def runSnippetsWithIgnoreFailed[T](ignore: Boolean)(f: => T): T =
+  _ignoreFailedSnippets.doWith(ignore)(f)
+
+  /**
+   *
+   * @return should failed snippets be ignored and have the original NodeSeq
+   *         returned?
+   */
+  def ignoreFailedSnippets: Boolean = _ignoreFailedSnippets.box openOr false
+
   private object _currentSnippet extends RequestVar[Box[String]](Empty)
 
   private[http] def doSnippet[T](name: String)(f: => T): T = {
@@ -2344,9 +2509,9 @@ for {
                 val future: LAFuture[Any] = new LAFuture
 
                 updateFunctionMap(name, new S.ProxyFuncHolder(value) {
-                  override def apply(in: List[String]): Any = future.get(5000).open_!
+                  override def apply(in: List[String]): Any = future.get(5000).openOrThrowException("legacy code")
 
-                  override def apply(in: FileParamHolder): Any = future.get(5000).open_!
+                  override def apply(in: FileParamHolder): Any = future.get(5000).openOrThrowException("legacy code")
                 })
 
                 future
@@ -2362,7 +2527,7 @@ for {
               override def apply(in: List[String]): Any = {
                 val ns = fixShot()
                 if (ns) {
-                  theFuture.get(5000).open_!
+                  theFuture.get(5000).openOrThrowException("legacy code")
                 } else {
                   val future = theFuture
                   try {
@@ -2379,7 +2544,7 @@ for {
                 val ns = fixShot()
 
                 if (ns) {
-                  theFuture.get(5000).open_!
+                  theFuture.get(5000).openOrThrowException("legacy code")
                 } else {
                   val future = theFuture
                   try {
@@ -2399,8 +2564,6 @@ for {
       }
     }
   }
-
-  private def booster(lst: List[String], func: String => Any): Unit = lst.foreach(v => func(v))
 
   /**
    * Decorates an URL with jsessionid parameter in case cookies are disabled from the container. Also
@@ -2591,10 +2754,10 @@ for {
    */
   private[http] def noticesToJsCmd: JsCmd = LiftRules.noticesToJsCmd()
 
-  @deprecated("Use AFuncHolder.listStrToAF")
+  @deprecated("Use AFuncHolder.listStrToAF", "2.4")
   def toLFunc(in: List[String] => Any): AFuncHolder = LFuncHolder(in, Empty)
- 
-  @deprecated("Use AFuncHolder.unitToAF")
+
+  @deprecated("Use AFuncHolder.unitToAF", "2.4")
   def toNFunc(in: () => Any): AFuncHolder = NFuncHolder(in, Empty)
 
   implicit def stuff2ToUnpref(in: (Symbol, Any)): UnprefixedAttribute = new UnprefixedAttribute(in._1.name, Text(in._2.toString), Null)
@@ -2644,10 +2807,10 @@ for {
     def doRender(session: LiftSession): NodeSeq =
       session.processSurroundAndInclude("external render", xhtml)
 
-    if (inS.value) doRender(session.open_!)
+    if (inS.value) doRender(session.openOrThrowException("legacy code"))
     else {
       val req = Req(httpRequest, LiftRules.statelessRewrite.toList,
-                    LiftRules.statelessTest.toList,
+                    Nil,
                     LiftRules.statelessReqTest.toList,
                     System.nanoTime)
 
@@ -2657,17 +2820,17 @@ for {
           case Full(ret) =>
             ret.fixSessionTime()
           ret
-          
+
           case _ =>
             val ret = LiftSession(httpRequest.session, req.contextPath)
           ret.fixSessionTime()
-          SessionMaster.addSession(ret, 
+          SessionMaster.addSession(ret,
                                    req,
-                                   httpRequest.userAgent, 
+                                   httpRequest.userAgent,
                                    SessionMaster.getIpFromReq(req))
           ret
         }
-        
+
         init(req, ses) {
           doRender(ses)
         }
@@ -2690,7 +2853,7 @@ for {
    *
    * Use fmapFunc(AFuncHolder)(String => T)
    */
-  @deprecated("Use fmapFunc(AFuncHolder)(String => T)")
+  @deprecated("Use fmapFunc(AFuncHolder)(String => T)", "2.4")
   def mapFunc(in: AFuncHolder): String = {
     mapFunc(formFuncName, in)
   }
@@ -2700,7 +2863,7 @@ for {
    *
    * Use fmapFunc(AFuncHolder)(String => T)
    */
-  @deprecated("Use fmapFunc(AFuncHolder)(String => T)")
+  @deprecated("Use fmapFunc(AFuncHolder)(String => T)", "2.4")
   def mapFunc(name: String, inf: AFuncHolder): String = {
     addFunctionMap(name, inf)
     name
@@ -2710,14 +2873,14 @@ for {
   /**
    * Returns all the HTTP parameters having 'n' name
    */
-  def params(n: String): List[String] = 
+  def params(n: String): List[String] =
     paramsForComet.get.get(n) getOrElse
     request.flatMap(_.params.get(n)).openOr(Nil)
 
   /**
    * Returns the HTTP parameter having 'n' name
    */
-  def param(n: String): Box[String] = 
+  def param(n: String): Box[String] =
     paramsForComet.get.get(n).flatMap(_.headOption) orElse
     request.flatMap(r => Box(r.param(n)))
 
@@ -2749,42 +2912,42 @@ for {
   def error(id: String, n: String) {error(id, Text(n))}
 
   /**
-   * Sets an NOTICE notice as plain text
+   * Sets a NOTICE notice as plain text
    */
   def notice(n: String) {notice(Text(n))}
 
   /**
-   * Sets an NOTICE notice as an XML sequence
+   * Sets a NOTICE notice as an XML sequence
    */
   def notice(n: NodeSeq) {p_notice.is += ((NoticeType.Notice, n, Empty))}
 
   /**
-   * Sets an NOTICE notice as and XML sequence and associates it with an id
+   * Sets a NOTICE notice as and XML sequence and associates it with an id
    */
   def notice(id: String, n: NodeSeq) {p_notice.is += ((NoticeType.Notice, n, Full(id)))}
 
   /**
-   * Sets an NOTICE notice as plai text and associates it with an id
+   * Sets a NOTICE notice as plai text and associates it with an id
    */
   def notice(id: String, n: String) {notice(id, Text(n))}
 
   /**
-   * Sets an WARNING notice as plain text
+   * Sets a WARNING notice as plain text
    */
   def warning(n: String) {warning(Text(n))}
 
   /**
-   * Sets an WARNING notice as an XML sequence
+   * Sets a WARNING notice as an XML sequence
    */
   def warning(n: NodeSeq) {p_notice += ((NoticeType.Warning, n, Empty))}
 
   /**
-   * Sets an WARNING notice as an XML sequence and associates it with an id
+   * Sets a WARNING notice as an XML sequence and associates it with an id
    */
   def warning(id: String, n: NodeSeq) {p_notice += ((NoticeType.Warning, n, Full(id)))}
 
   /**
-   * Sets an WARNING notice as plain text and associates it with an id
+   * Sets a WARNING notice as plain text and associates it with an id
    */
   def warning(id: String, n: String) {warning(id, Text(n))}
 
@@ -2865,7 +3028,7 @@ for {
   def idMessages(f: => List[(NodeSeq, Box[String])]): List[(String, List[NodeSeq])] = {
     val res = new HashMap[String, List[NodeSeq]]
     f filter (_._2.isEmpty == false) foreach (_ match {
-      case (node, id) => val key = id open_!; res += (key -> (res.getOrElseUpdate(key, Nil) ::: List(node)))
+      case (node, id) => val key = id openOrThrowException("legacy code"); res += (key -> (res.getOrElseUpdate(key, Nil) ::: List(node)))
     })
 
     res toList
@@ -2884,10 +3047,10 @@ for {
    *
    */
   def respondAsync(f: => Box[LiftResponse]): () => Box[LiftResponse] = {
-   (for (req <- S.request) yield {
-     RestContinuation.respondAsync(req)(f)
-   }) openOr (() => Full(EmptyResponse))
+    RestContinuation.async {reply => reply(f.openOr(EmptyResponse))}
   }
+
+
 
   /**
    * If you bind functions (i.e. using SHtml helpers) inside the closure passed to callOnce,
@@ -2915,8 +3078,7 @@ for {
 /**
  * Defines the notices types
  */
-@serializable
-object NoticeType {
+object NoticeType extends Serializable{
   sealed abstract class Value(val title : String) {
     def lowerCaseTitle = title.toLowerCase
 

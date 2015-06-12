@@ -26,7 +26,23 @@ import util.Helpers._
 import js._
 import auth._
 import provider._
+import json.JsonAST.JValue
+import net.liftweb.json._
+import java.util.concurrent.atomic.AtomicInteger
 
+
+/**
+ * Wrap a LiftResponse and cache the result to avoid computing the actual response
+ * more than once
+ */
+private [http] case class CachedResponse(wrapped: LiftResponse) extends LiftResponse {
+  private val _cachedResponse = wrapped.toResponse
+
+  def toResponse = _cachedResponse
+
+  // Should we retry request processing
+  def failed_? = _cachedResponse.code >= 500 && _cachedResponse.code < 600
+}
 
 class LiftServlet extends Loggable {
   private var servletContext: HTTPContext = null
@@ -213,22 +229,26 @@ class LiftServlet extends Loggable {
       }.isDefined
     }
 
-    def isCometOrAjax(req: Req): Boolean = {
-      val wp = req.path.wholePath
-      val len = wp.length
-
-      if (len < 2) false
+    val wp = req.path.wholePath
+    val pathLen = wp.length
+    def isComet: Boolean = {
+      if (pathLen < 2) false
       else {
         val kindaComet = wp.head == LiftRules.cometPath
-        val cometScript = (len >= 3 && kindaComet &&
+        val cometScript = (pathLen >= 3 && kindaComet &&
           wp(2) == LiftRules.cometScriptName())
+
+        (kindaComet && !cometScript) && req.acceptsJavaScript_?
+      }
+    }
+    def isAjax: Boolean = {
+      if (pathLen < 2) false
+      else {
         val kindaAjax = wp.head == LiftRules.ajaxPath
-        val ajaxScript = len >= 2 && kindaAjax &&
+        val ajaxScript = kindaAjax &&
           wp(1) == LiftRules.ajaxScriptName()
 
-
-        ((kindaComet && !cometScript) || (kindaAjax && !ajaxScript)) &&
-          req.acceptsJavaScript_?
+        (kindaAjax && !ajaxScript) && req.acceptsJavaScript_?
       }
     }
 
@@ -240,30 +260,32 @@ class LiftServlet extends Loggable {
         LiftRules.notFoundOrIgnore(req, Empty)
       } else if (!authPassed_?(req)) {
         Full(LiftRules.authentication.unauthorizedResponse)
-      } else if (LiftRules.redirectAjaxOnSessionLoss && !hasSession(sessionIdCalc.id) && isCometOrAjax(req)) {
-
+      } else if (LiftRules.redirectAsyncOnSessionLoss && !hasSession(sessionIdCalc.id) && (isComet || isAjax)) {
         val theId = sessionIdCalc.id
-        // okay after 2 attempts to redirect, just
-        // ignore calls to the comet URL
+
+        // okay after 2 attempts to redirect, just ignore calls to the
+        // async URL
         if (recentlyChecked(theId) > 1) {
           Empty
         } else {
-          Full(JavaScriptResponse(js.JE.JsRaw("window.location = " +
-            (req.request.
-              header("Referer") openOr
-              "/").encJs).cmd, Nil, Nil, 200))
+          val cmd =
+            if (isComet)
+              js.JE.JsRaw(LiftRules.noCometSessionCmd.vend.toJsCmd + ";lift_toWatch = {};").cmd
+            else
+              js.JE.JsRaw(LiftRules.noAjaxSessionCmd.vend.toJsCmd).cmd
+
+          Full(new JsCommands(cmd :: Nil).toResponse)
         }
-      } else
-      // if the request is matched is defined in the stateless table, dispatch
-      if (S.statelessInit(req) {
+      } else if (S.statelessInit(req) {
+        // if the request is matched is defined in the stateless table, dispatch
         tmpStatelessHolder = NamedPF.applyBox(req,
-          LiftRules.statelessDispatchTable.toList).map(_.apply() match {
+          LiftRules.statelessDispatch.toList).map(_.apply() match {
           case Full(a) => Full(LiftRules.convertResponse((a, Nil, S.responseCookies, req)))
           case r => r
-        });
+        })
         tmpStatelessHolder.isDefined
       }) {
-        val f = tmpStatelessHolder.open_!
+        val f = tmpStatelessHolder.openOrThrowException("This is a full box here, checked on previous line")
         f match {
           case Full(v) => Full(v)
           case Empty => LiftRules.notFoundOrIgnore(req, Empty)
@@ -276,7 +298,7 @@ class LiftServlet extends Loggable {
         def doSession(r2: Req, s2: LiftSession, continue: Box[() => Nothing]): () => Box[LiftResponse] = {
           try {
             S.init(r2, s2) {
-              dispatchStatefulRequest(S.request.open_!, liftSession, r2, continue)
+              dispatchStatefulRequest(S.request.openOrThrowException("I'm pretty sure this is a full box here"), liftSession, r2, continue)
             }
           } catch {
             case cre: ContinueResponseException =>
@@ -291,10 +313,7 @@ class LiftServlet extends Loggable {
       }
     } catch {
       case foc: LiftFlowOfControlException => throw foc
-      case e: Exception if !e.getClass.getName.endsWith("RetryRequest") => {
-        val bundle = (Props.mode, req, e)
-        NamedPF.applyBox(bundle, LiftRules.exceptionHandler.toList)
-      }
+      case e: Exception if !e.getClass.getName.endsWith("RetryRequest") => S.runExceptionHandlers(req, e)
     }
 
     tryo {
@@ -353,24 +372,14 @@ class LiftServlet extends Loggable {
                   }
                 }
               } catch {
-                case ContinueResponseException(cre) => throw cre
-
                 case ite: java.lang.reflect.InvocationTargetException if (ite.getCause.isInstanceOf[ResponseShortcutException]) =>
                   (true, Full(liftSession.handleRedirect(ite.getCause.asInstanceOf[ResponseShortcutException], req)))
 
                 case rd: net.liftweb.http.ResponseShortcutException => (true, Full(liftSession.handleRedirect(rd, req)))
-
-                case e if (e.getClass.getName.endsWith("RetryRequest")) => throw e
-
-                case e: LiftFlowOfControlException => throw e
-
-                case e => (true, NamedPF.applyBox((Props.mode, req, e), LiftRules.exceptionHandler.toList))
-
               }
-
             } finally {
               if (S.functionMap.size > 0) {
-                liftSession.updateFunctionMap(S.functionMap, S.uri, millis)
+                liftSession.updateFunctionMap(S.functionMap, S.renderVersion, millis)
                 S.clearFunctionMap
               }
               liftSession.notices = S.getNotices
@@ -417,23 +426,60 @@ class LiftServlet extends Loggable {
     toReturn
   }
 
-  private def extractVersion(path: List[String]) {
+  /**
+   * Tracks the two aspects of an AJAX version: the sequence number,
+   * whose sole purpose is to identify requests that are retries for the
+   * same resource, and pending requests, which indicates how many
+   * requests are still queued for this particular page version on the
+   * client. The latter is used to expire result data for sequence
+   * numbers that are no longer needed.
+   */
+  private case class AjaxVersionInfo(renderVersion:String, sequenceNumber:Long, pendingRequests:Int)
+  private object AjaxVersions {
+    def unapply(ajaxPathPart: String) : Option[AjaxVersionInfo] = {
+      val separator = ajaxPathPart.indexOf("-")
+      if (separator > -1 && ajaxPathPart.length > separator + 2)
+        Some(
+          AjaxVersionInfo(ajaxPathPart.substring(0, separator),
+            java.lang.Long.parseLong(ajaxPathPart.substring(separator + 1, ajaxPathPart.length - 1), 36),
+            Integer.parseInt(ajaxPathPart.substring(ajaxPathPart.length - 1), 36))
+        )
+      else
+        None
+    }
+  }
+  /**
+   * Extracts two versions from a given AJAX path:
+   *  - The RenderVersion, which is used for GC purposes.
+   *  - The requestVersions, which let us determine if this is
+   *    a request we've already dealt with or are currently dealing
+   *    with (so we don't rerun the associated handler). See
+   *    handleVersionedAjax for more.
+   *
+   * The requestVersion is passed to the function that is passed in.
+   */
+  private def extractVersions[T](path: List[String])(f: (Box[AjaxVersionInfo]) => T): T = {
     path match {
-      case first :: second :: _ => RenderVersion.set(second)
-      case _ =>
+      case ajaxPath :: AjaxVersions(versionInfo @ AjaxVersionInfo(renderVersion, _, _)) :: _ =>
+        RenderVersion.doWith(renderVersion)(f(Full(versionInfo)))
+      case ajaxPath :: renderVersion :: _ =>
+        RenderVersion.doWith(renderVersion)(f(Empty))
+      case _ => f(Empty)
     }
   }
 
-  private def handleAjax(liftSession: LiftSession,
-                         requestState: Req): Box[LiftResponse] = {
-    extractVersion(requestState.path.partPath)
-
-    LiftRules.cometLogger.debug("AJAX Request: " + liftSession.uniqueId + " " + requestState.params)
-    tryo {
-      LiftSession.onBeginServicing.foreach(_(liftSession, requestState))
-    }
-
-    val ret = try {
+  /**
+   * Runs the actual AJAX processing. This includes handling __lift__GC,
+   * or running the parameters in the session. onComplete is run when the
+   * AJAX request has completed with a response that is meant for the
+   * user. In cases where the request is taking too long to respond,
+   * an LAFuture may be used to delay the real response (and thus the
+   * invocation of onComplete) while this function returns an empty
+   * response.
+   */
+  private def runAjax(liftSession: LiftSession,
+                      requestState: Req): Box[LiftResponse] = {
+    try {
       requestState.param("__lift__GC") match {
         case Full(_) =>
           liftSession.updateFuncByOwner(RenderVersion.get, millis)
@@ -451,6 +497,7 @@ class LiftServlet extends Loggable {
 
             val what2 = what.flatMap {
               case js: JsCmd => List(js)
+              case jv: JValue => List(jv)
               case n: NodeSeq => List(n)
               case js: JsCommands => List(js)
               case r: LiftResponse => List(r)
@@ -459,6 +506,7 @@ class LiftServlet extends Loggable {
 
             val ret: LiftResponse = what2 match {
               case (json: JsObj) :: Nil => JsonResponse(json)
+              case (jv: JValue) :: Nil => JsonResponse(jv)
               case (js: JsCmd) :: xs => {
                 (JsCommands(S.noticesToJsCmd :: Nil) &
                   ((js :: xs).flatMap {
@@ -478,20 +526,142 @@ class LiftServlet extends Loggable {
 
             Full(ret)
           } finally {
-            liftSession.updateFunctionMap(S.functionMap, RenderVersion.get, millis)
+            if (S.functionMap.size > 0) {
+              liftSession.updateFunctionMap(S.functionMap, RenderVersion.get, millis)
+              S.clearFunctionMap
+            }
           }
       }
     } catch {
       case foc: LiftFlowOfControlException => throw foc
-      case e => NamedPF.applyBox((Props.mode, requestState, e), LiftRules.exceptionHandler.toList);
+      case e => S.runExceptionHandlers(requestState, e)
     }
-    tryo {
-      LiftSession.onEndServicing.foreach(_(liftSession, requestState, ret))
-    }
-    ret
   }
 
+  // Retry requests will stop trying to wait for the original request to
+  // complete 500ms after the client's timeout. This is because, while
+  // we want the original thread to complete so that it can provide an
+  // answer for future retries, we don't want retries tying up resources
+  // when the client won't receive the response anyway.
+  private lazy val ajaxPostTimeout: Long = LiftRules.ajaxPostTimeout * 1000L + 500L
   /**
+   * Kick off AJAX handling. Extracts relevant versions and handles the
+   * begin/end servicing requests. Then checks whether to wait on an
+   * existing request for this same version to complete or whether to
+   * do the actual processing.
+   */
+  private def handleAjax(liftSession: LiftSession,
+                         requestState: Req): Box[LiftResponse] = {
+    extractVersions(requestState.path.partPath) { versionInfo =>
+      LiftRules.cometLogger.debug("AJAX Request: " + liftSession.uniqueId + " " + requestState.params)
+      tryo {
+        LiftSession.onBeginServicing.foreach(_(liftSession, requestState))
+      }
+
+      LiftRules.makeCometBreakoutDecision(liftSession, requestState)
+
+      // Here, a Left[LAFuture] indicates a future that needs to be
+      // *satisfied*, meaning we will run the request processing.
+      // A Right[LAFuture] indicates a future we need to *wait* on,
+      // meaning we will return the result of whatever satisfies the
+      // future.
+      val nextAction:Either[LAFuture[Box[LiftResponse]], LAFuture[Box[LiftResponse]]] =
+        versionInfo match {
+          case Full(AjaxVersionInfo(_, handlerVersion, pendingRequests)) =>
+            val renderVersion = RenderVersion.get
+
+            liftSession.withAjaxRequests { currentAjaxRequests =>
+              // Create a new future, put it in the request list, and return
+              // the associated info with the future that needs to be
+              // satisfied by the current request handler.
+              def newRequestInfo = {
+                val info = AjaxRequestInfo(handlerVersion, new LAFuture[Box[LiftResponse]], millis)
+
+                val existing = currentAjaxRequests.getOrElseUpdate(renderVersion, Nil)
+                currentAjaxRequests += (renderVersion -> (info :: existing))
+
+                info
+              }
+
+              val infoList = currentAjaxRequests.get(renderVersion)
+              val (requestInfo, result) =
+                infoList
+                  .flatMap { entries =>
+                    entries
+                      .find(_.requestVersion == handlerVersion)
+                      .map { entry =>
+                        (entry, Right(entry.responseFuture))
+                      }
+                  }
+                  .getOrElse {
+                    val entry = newRequestInfo
+
+                    (entry, Left(entry.responseFuture))
+                  }
+
+              // If there are no other pending requests, we can
+              // invalidate all the render version's AJAX entries except
+              // for the current one, as the client is no longer looking
+              // to retry any of them.
+              if (pendingRequests == 0) {
+                // Satisfy anyone waiting on futures for invalid
+                // requests with a failure.
+                for {
+                  list <- infoList
+                  entry <- list if entry.requestVersion != handlerVersion
+                } {
+                  entry.responseFuture.satisfy(Failure("Request no longer pending."))
+                }
+
+                currentAjaxRequests += (renderVersion -> List(requestInfo))
+              }
+
+              result
+            }
+
+          case _ =>
+            // Create a future that processes the ajax response
+            // immediately. This runs if we don't have a handler
+            // version, which happens in cases like AJAX requests for
+            // Lift GC that don't go through the de-duping pipeline.
+            // Because we always return a Left here, the ajax processing
+            // always runs for this type of request.
+            Left(new LAFuture[Box[LiftResponse]])
+        }
+
+      val ret:Box[LiftResponse] =
+        nextAction match {
+          case Left(future) =>
+            val result = runAjax(liftSession, requestState) map CachedResponse
+            
+            if (result.exists(_.failed_?)) {
+              // The request failed. The client will retry it, so
+              // remove it from the list of current Ajax requests that
+              // needs to be satisfied so we re-process the next request
+              // from scratch
+              liftSession.withAjaxRequests { currentAjaxRequests =>
+                currentAjaxRequests.remove(RenderVersion.get)
+              }
+            }
+
+            future.satisfy(result)
+            result
+
+          case Right(future) =>
+            val ret = future.get(ajaxPostTimeout) openOr Failure("AJAX retry timeout.")
+
+            ret
+        }
+
+      tryo {
+        LiftSession.onEndServicing.foreach(_(liftSession, requestState, ret))
+      }
+
+      ret
+    }
+  }
+
+/**
    * An actor that manages continuations from container (Jetty style)
    */
   class ContinuationActor(request: Req, session: LiftSession,
@@ -510,7 +680,7 @@ class LiftServlet extends Loggable {
         }
 
       case ar: AnswerRender =>
-        answers = ar :: answers
+        answers ::= ar
         LAPinger.schedule(this, BreakOut(), 5 millis)
 
       case BreakOut() if !done =>
@@ -524,7 +694,7 @@ class LiftServlet extends Loggable {
       case _ =>
     }
 
-    override def toString = "Actor dude " + seqId
+    // override def toString = "Actor dude " + seqId
   }
 
   private object BeginContinuation
@@ -533,11 +703,12 @@ class LiftServlet extends Loggable {
 
   private def setupContinuation(request: Req, session: LiftSession, actors: List[(LiftCometActor, Long)]): Any = {
     val cont = new ContinuationActor(request, session, actors,
-      answers => request.request.resume(
+      answers => {
+        request.request.resume(
         (request, S.init(request, session)
           (LiftRules.performTransform(
             convertAnswersToCometResponse(session,
-              answers.toList, actors))))))
+              answers.toList, actors)))))})
 
 
     try {
@@ -558,7 +729,7 @@ class LiftServlet extends Loggable {
           sessionActor.getAsyncComponent(name).toList.map(c => (c, toLong(when)))
       }
 
-    if (actors.isEmpty) Left(Full(new JsCommands(new JE.JsRaw("lift_toWatch = {}") with JsCmd :: JsCmds.RedirectTo(LiftRules.noCometSessionPage) :: Nil).toResponse))
+    if (actors.isEmpty) Left(Full(new JsCommands(LiftRules.noCometSessionCmd.vend :: js.JE.JsRaw("lift_toWatch = {};").cmd :: Nil).toResponse))
     else requestState.request.suspendResumeSupport_? match {
       case true => {
         setupContinuation(requestState, sessionActor, actors)
@@ -619,7 +790,7 @@ class LiftServlet extends Loggable {
 
       LAPinger.schedule(cont, BreakOut(), TimeSpan(cometTimeout))
 
-      val ret2 = f.get(cometTimeout) openOr Nil
+      val ret2 = f.get(cometTimeout + 50L) openOr Nil
 
       Full(S.init(originalRequest, session) {
         convertAnswersToCometResponse(session, ret2, actors)

@@ -1,5 +1,5 @@
 /*
- * Copyright 2007-2011 WorldWide Conferencing, LLC
+ * Copyright 2007-2013 WorldWide Conferencing, LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,12 @@
 package net.liftweb
 package http
 
-import java.io.InputStream
-import java.lang.reflect.{Method, Modifier, InvocationTargetException}
-import java.util.concurrent.TimeUnit
-import java.util.Locale
+import java.lang.reflect.Method
+import java.util.concurrent.ConcurrentHashMap
 
-import collection.mutable.{HashMap, ArrayBuffer, ListBuffer}
-import reflect.Manifest
+import collection.mutable.{ConcurrentMap, HashMap, ListBuffer}
+import collection.JavaConversions
+
 import xml._
 
 import common._
@@ -91,6 +90,8 @@ object LiftSession {
    */
   var onEndServicing: List[(LiftSession, Req, Box[LiftResponse]) => Unit] = Nil
 
+
+
   @volatile private var constructorCache: Map[(Class[_], Box[Class[_]]), Box[ConstructorType]] = Map()
 
   private[http] def constructFrom[T](session: LiftSession, pp: Box[ParamPair], clz: Class[T]): Box[T] = {
@@ -138,8 +139,8 @@ object LiftSession {
       }
     }).map {
       case uc: UnitConstructor => uc.makeOne
-      case pc: PConstructor => pc.makeOne(pp.open_!.v) // open_! okay
-      case psc: PAndSessionConstructor => psc.makeOne(pp.open_!.v, session)
+      case pc: PConstructor => pc.makeOne(pp.openOrThrowException("It's ok").v)
+      case psc: PAndSessionConstructor => psc.makeOne(pp.openOrThrowException("It's ok").v, session)
     }
   }
 
@@ -147,10 +148,33 @@ object LiftSession {
    * Check to see if the template is marked designer friendly
    * and lop off the stuff before the first surround
    */
-  @deprecated("Use Templates.checkForContentId")
+  @deprecated("Use Templates.checkForContentId", "2.3")
   def checkForContentId(in: NodeSeq): NodeSeq =
     Templates.checkForContentId(in)
 
+  /**
+   * Cache for findSnippetClass lookups.
+   */
+  private val snippetClassMap: ConcurrentMap[String, Box[Class[AnyRef]]] = JavaConversions.asScalaConcurrentMap(new ConcurrentHashMap())
+  
+  /*
+   * Given a Snippet name, try to determine the fully-qualified Class
+   * so that we can instantiate it via reflection.
+   */
+  def findSnippetClass(name: String): Box[Class[AnyRef]] = {
+    if (name == null) Empty
+    else {
+      snippetClassMap.getOrElseUpdate(name,{
+        // Name might contain some relative packages, so split them out and put them in the proper argument of findClass
+        val (packageSuffix, terminal) = name.lastIndexOf('.') match {
+          case -1 => ("", name)
+          case i => ("." + name.substring(0, i), name.substring(i + 1))
+        }
+        findClass(terminal, LiftRules.buildPackage("snippet").map(_ + packageSuffix) :::
+          (("lift.app.snippet" + packageSuffix) :: ("net.liftweb.builtin.snippet" + packageSuffix) :: Nil))
+      })
+    }
+  }
 
 }
 
@@ -212,6 +236,18 @@ object SessionMaster extends LiftActor with Loggable {
           } or Full(LiftRules.statelessSession.vend.apply(req))
         case _ => getSession(req.request, otherId)
       }
+    }
+  }
+
+
+  /**
+   * End comet long polling for all sessions. This allows a clean reload of Nginx
+   * because Nginx children stick around for long polling.
+   */
+  def breakOutAllComet() {
+    val ses = lockRead(sessions)
+    ses.valuesIterator.foreach {
+      _.session.breakOutComet()
     }
   }
 
@@ -397,15 +433,33 @@ private[http] object RenderVersion {
 
   def get: String = ver.is
 
-  def doWith[T](v: String)(f: => T): T = ver.doWith(v)(f)
+  def doWith[T](v: String)(f: => T): T = {
+    val ret: Box[T] =
+      for {
+        sess <- S.session
+        func <- sess.findFunc(v).collect {
+          case f: S.PageStateHolder => f
+        }
+      } yield {
+        val tret = ver.doWith(v) {
+          val ret = func.runInContext(f)
 
-  def set(value: String) {
-    ver(value)
+
+          if (S.functionMap.size > 0) {
+            sess.updateFunctionMap(S.functionMap, this.get, millis)
+            S.clearFunctionMap
+          }
+          ret
+        }
+        tret
+      }
+
+    ret openOr ver.doWith(v)(f)
   }
 }
 
 /**
- * A trait defining how stateful the session is 
+ * A trait defining how stateful the session is
  */
 trait HowStateful {
   private val howStateful = new ThreadGlobal[Boolean]
@@ -486,17 +540,23 @@ private final case class PostPageFunctions(renderVersion: String,
 }
 
 /**
+ * The responseFuture will be satisfied by the original request handling
+ * thread when the response has been calculated. Retries will wait for the
+ * future to be satisfied in order to return the proper response.
+ */
+private[http] final case class AjaxRequestInfo(requestVersion: Long,
+                                               responseFuture: LAFuture[Box[LiftResponse]],
+                                               lastSeen: Long)
+
+/**
  * The LiftSession class containg the session state information
  */
 class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
                   val httpSession: Box[HTTPSession]) extends LiftMerge with Loggable with HowStateful {
-  val sessionHtmlProperties: SessionVar[HtmlProperties] =
-    new SessionVar[HtmlProperties](LiftRules.htmlProperties.vend(
-      S.request openOr Req.nil
-    )) {}
+  def sessionHtmlProperties = LiftRules.htmlProperties.session.is.make openOr LiftRules.htmlProperties.default.is.vend
 
   val requestHtmlProperties: TransientRequestVar[HtmlProperties] =
-    new TransientRequestVar[HtmlProperties](sessionHtmlProperties.is) {}
+    new TransientRequestVar[HtmlProperties](sessionHtmlProperties(S.request openOr Req.nil)) {}
 
   @volatile
   private[http] var markedForTermination = false
@@ -518,13 +578,17 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
    *  ****IMPORTANT**** when you access messageCallback, it *MUST*
    * be in a block that's synchronized on the owner LiftSession
    */
-  private var messageCallback: HashMap[String, S.AFuncHolder] = new HashMap
+  private val nmessageCallback: ConcurrentHashMap[String, S.AFuncHolder] = new ConcurrentHashMap
+
+  private val msgCallbackSync = new Object
 
   private[http] var notices: Seq[(NoticeType.Value, NodeSeq, Box[String])] = Nil
 
-  private var asyncComponents = new HashMap[(Box[String], Box[String]), LiftCometActor]()
+  private val nasyncComponents = new ConcurrentHashMap[(Box[String], Box[String]), LiftCometActor]()
 
-  private var asyncById = new HashMap[String, LiftCometActor]()
+  private val nasyncById = new ConcurrentHashMap[String, LiftCometActor]()
+
+  private val asyncSync = new Object
 
   private var myVariables: Map[String, Any] = Map.empty
 
@@ -533,10 +597,30 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   private val sessionVarSync = new Object
 
   /**
+  * Cache the value of allowing snippet attribute processing
+  */
+  private object allowAttributeProcessing extends TransientRequestVar(LiftRules.allowAttributeSnippets.vend())
+
+  /**
    * A mapping between pages denoted by RenderVersion and
    * functions to execute at the end of the page rendering
    */
+  @volatile
   private var postPageFunctions: Map[String, PostPageFunctions] = Map()
+
+  /**
+   * A list of AJAX requests that may or may not be pending for this
+   * session. There is an entry for every AJAX request we don't *know*
+   * has completed successfully or been discarded by the client.
+   *
+   * See LiftServlet.handleAjax for how we determine we no longer need
+   * to hold a reference to an AJAX request.
+   */
+  private var ajaxRequests = scala.collection.mutable.Map[String,List[AjaxRequestInfo]]()
+
+  private[http] def withAjaxRequests[T](fn: (scala.collection.mutable.Map[String, List[AjaxRequestInfo]]) => T) = {
+    ajaxRequests.synchronized { fn(ajaxRequests) }
+  }
 
   /**
    * The synchronization lock for the postPageFunctions
@@ -579,7 +663,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
 
     lastServiceTime = millis
     LiftSession.onSetupSession.foreach(_(this))
-    sessionHtmlProperties.is // cause the properties to be calculated
+    sessionHtmlProperties // cause the properties to be calculated
   }
 
   def running_? = _running_?
@@ -587,24 +671,47 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   private var cometList: List[(LiftActor, Req)] = Nil
 
   private[http] def breakOutComet(): Unit = {
-    val cl = synchronized {
+    val cl = asyncSync.synchronized {
       cometList
     }
     cl.foreach(_._1 ! BreakOut())
   }
 
-  private[http] def cometForHost(hostAndPath: String): List[(LiftActor, Req)] =
-    synchronized {
+  // Returns a 2-tuple: _1 is a list of valid (LiftActor, Req) pairs for
+  // this session that match the given hostAndPath, while _2 is a list
+  // of invalid (LiftActor, Req) pairs.
+  //
+  // Invalid pairs are pairs where the hostAndPath lookup for the
+  // associated Req fails by throwing an exception. Typically this
+  // happens on overloaded containers that leave Reqs with underlying
+  // HttpServletRequests that have expired; these will then throw
+  // NullPointerExceptions when their server name or otherwise are
+  // accessed.
+  def cometForHost(hostAndPath: String): (List[(LiftActor, Req)], List[(LiftActor, Req)]) =
+    asyncSync.synchronized {
       cometList
-    }.filter {
-      case (_, r) => r.hostAndPath == hostAndPath
+    }.foldLeft((List[(LiftActor, Req)](), List[(LiftActor, Req)]())) {
+      (soFar, current) =>
+        (soFar, current) match {
+          case ((valid, invalid), pair @ (_, r)) =>
+            try {
+              if (r.hostAndPath == hostAndPath)
+                (pair :: valid, invalid)
+              else
+                soFar
+            } catch {
+              case exception =>
+                (valid, pair :: invalid)
+            }
+        }
     }
 
-  private[http] def enterComet(what: (LiftActor, Req)): Unit = synchronized {
+  private[http] def enterComet(what: (LiftActor, Req)): Unit = asyncSync.synchronized {
+    LiftRules.makeCometBreakoutDecision(this, what._2)
     cometList = what :: cometList
   }
 
-  private[http] def exitComet(what: LiftActor): Unit = synchronized {
+  private[http] def exitComet(what: LiftActor): Unit = asyncSync.synchronized {
     cometList = cometList.filterNot(_._1 eq what)
   }
 
@@ -620,6 +727,15 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     }
   }
 
+
+  /**
+   * Find a function in the function lookup table.  You probably never need to do this, but
+   * well, you can look them up.
+   */
+  def findFunc(funcName: String): Option[S.AFuncHolder] =
+    Option(nmessageCallback.get(funcName))
+
+
   /**
    * Executes the user's functions based on the query parameters
    */
@@ -629,9 +745,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
       // get all the commands, sorted by owner,
       (state.uploadedFiles.map(_.name) ::: state.paramNames).distinct.
         flatMap {
-        n => synchronized {
-          messageCallback.get(n)
-        }.map(mcb => RunnerHolder(n, mcb, mcb.owner))
+        n => Box.legacyNullTest(nmessageCallback.get(n)).map(mcb => RunnerHolder(n, mcb, mcb.owner)).toList
       }.
         sortWith {
         case (RunnerHolder(_, _, Full(a)), RunnerHolder(_, _, Full(b))) if a < b => true
@@ -657,11 +771,9 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
         val f = toRun.filter(_.owner == w)
         w match {
           // if it's going to a CometActor, batch up the commands
-          case Full(id) if asyncById.contains(id) => asyncById.get(id).toList.flatMap(a =>
-            a.!?(a.cometProcessingTimeout, ActionMessageSet(f.map(i => buildFunc(i)), state)) match {
-              case Full(li: List[_]) => li
+          case Full(id) if nasyncById.containsKey(id) => Option(nasyncById.get(id)).toList.flatMap(a =>
+            a.!?(ActionMessageSet(f.map(i => buildFunc(i)), state)) match {
               case li: List[_] => li
-              case Empty => Full(a.cometProcessingTimeoutHandler())
               case other => Nil
             })
           case _ => f.map(i => buildFunc(i).apply())
@@ -674,14 +786,17 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   /**
    * Updates the internal functions mapping
    */
-  def updateFunctionMap(funcs: Map[String, S.AFuncHolder], uniqueId: String, when: Long): Unit = synchronized {
+  def updateFunctionMap(funcs: Map[String, S.AFuncHolder], uniqueId: String, when: Long): Unit =
+    msgCallbackSync.synchronized {
     funcs.foreach {
-      case (name, func) => messageCallback(name) = func.duplicate(uniqueId)
+      case (name, func) =>
+        nmessageCallback.put(name,
+          if (func.owner == Full(uniqueId)) func else func.duplicate(uniqueId))
     }
   }
 
-  def removeFunction(name: String) = synchronized {
-    messageCallback -= name
+  def removeFunction(name: String) = {
+    nmessageCallback.remove(name)
   }
 
   /**
@@ -696,10 +811,10 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
    * Called just before the session exits.  If there's clean-up work, override this method
    */
   private[http] def cleanUpSession() {
-    messageCallback = HashMap.empty
+    nmessageCallback.clear()
     notices = Nil
-    asyncComponents.clear
-    asyncById = HashMap.empty
+    nasyncComponents.clear
+    nasyncById.clear()
     myVariables = Map.empty
     onSessionEnd = Nil
     postPageFunctions = Map()
@@ -707,7 +822,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     sessionRewriter = HashMap.empty
   }
 
-  private[http] def fixSessionTime(): Unit = synchronized {
+  def fixSessionTime(): Unit = synchronized {
     for (httpSession <- this.httpSession) {
       lastServiceTime = millis // DO NOT REMOVE THIS LINE!!!!!
       val diff = lastServiceTime - httpSession.lastAccessedTime
@@ -722,11 +837,9 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     }
   }
 
-  private[http] def doCometActorCleanup(): Unit = {
-    val acl = synchronized {
-      this.asyncComponents.values.toList
-    }
-    acl.foreach(_ ! ShutdownIfPastLifespan)
+  def doCometActorCleanup(): Unit = {
+    import scala.collection.JavaConversions._
+    this.nasyncComponents.values.foreach(_ ! ShutdownIfPastLifespan)
   }
 
   /**
@@ -749,7 +862,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
       // only deal with comet on stateful sessions
       // stateless temporary sessions bar comet use
       if (stateful_?) {
-        val cl = synchronized {
+        val cl = asyncSync.synchronized {
           cometList
         }
         if (cl.length > 0) {
@@ -770,7 +883,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     }
   }
 
-  private[http] def cleanupUnseenFuncs(): Unit = {
+  def cleanupUnseenFuncs(): Unit = {
     if (LiftRules.enableLiftGC && stateful_?) {
       val now = millis
 
@@ -783,15 +896,31 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
         }
       }
 
-      synchronized {
-        messageCallback.foreach {
-          case (k, f) =>
-            if (!f.sessionLife &&
-              f.owner.isDefined &&
-              (now - f.lastSeen) > LiftRules.unusedFunctionsLifeTime) {
-              messageCallback -= k
+      withAjaxRequests { currentAjaxRequests =>
+        for {
+          (version, requestInfos) <- currentAjaxRequests
+        } {
+          val remaining =
+            requestInfos.filter { info =>
+              (now - info.lastSeen) <= LiftRules.unusedFunctionsLifeTime
             }
+
+          if (remaining.length > 0)
+            currentAjaxRequests += (version -> remaining)
+          else
+            currentAjaxRequests -= version
         }
+      }
+
+
+      import scala.collection.JavaConversions._
+      nmessageCallback.foreach {
+        case (k, f) =>
+          if (!f.sessionLife &&
+            f.owner.isDefined &&
+            (now - f.lastSeen) > LiftRules.unusedFunctionsLifeTime) {
+            nmessageCallback.remove(k)
+          }
       }
     }
   }
@@ -910,8 +1039,16 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
       } postPageFunctions += (ownerName -> funcInfo.updateLastSeen)
     }
 
-    synchronized {
-      (0 /: messageCallback)((l, v) => l + (v._2.owner match {
+    withAjaxRequests { currentAjaxRequests =>
+      currentAjaxRequests.get(ownerName).foreach { requestInfos =>
+        val updated = requestInfos.map(_.copy(lastSeen = time))
+
+        currentAjaxRequests += (ownerName -> updated)
+      }
+    }
+
+      import scala.collection.JavaConversions._
+      (0 /: nmessageCallback)((l, v) => l + (v._2.owner match {
         case Full(owner) if (owner == ownerName) =>
           v._2.lastSeen = time
           1
@@ -919,14 +1056,14 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
         1
         case _ => 0
       }))
-    }
   }
 
   /**
    * Returns true if there are functions bound for this owner
    */
-  private[http] def hasFuncsForOwner(owner: String): Boolean = synchronized {
-    !messageCallback.find(_._2.owner == owner).isEmpty
+  private[http] def hasFuncsForOwner(owner: String): Boolean = {
+    import scala.collection.JavaConversions._
+    !nmessageCallback.find(_._2.owner == owner).isEmpty
   }
 
   private def shutDown() = {
@@ -941,7 +1078,8 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
 
         SessionMaster.sendMsg(RemoveSession(this.uniqueId))
 
-        asyncComponents.foreach {
+        import scala.collection.JavaConversions._
+        nasyncComponents.foreach {
           case (_, comp) => done ::= (() => tryo(comp ! ShutDown))
         }
         cleanUpSession()
@@ -974,7 +1112,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
    * @param path -- the ParsePath that led to this page
    * @param code -- the HTTP response code (usually 200)
    *
-   * @returns a Box of LiftResponse with all the proper page rewriting
+   * @return a Box of LiftResponse with all the proper page rewriting
    */
   def processTemplate(template: Box[NodeSeq], request: Req, path: ParsePath, code: Int): Box[LiftResponse] = {
     overrideResponseCode.doWith(Empty) {
@@ -997,6 +1135,10 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             // Phase 2: Head & Tail merge, add additional elements to body & head
             val xml = merge(rawXml, request)
 
+            // snapshot for ajax calls
+            nmessageCallback.put(S.renderVersion,
+              S.PageStateHolder(Full(S.renderVersion), this))
+
             // But we need to update the function map because there
             // may be addition functions created during the JsToAppend processing
             // See issue #983
@@ -1005,7 +1147,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             notices = Nil
             // Phase 3: Response conversion including fixHtml
             LiftRules.convertResponse((xml, overrideResponseCode.is openOr code),
-              S.getHeaders(LiftRules.defaultHeaders((xml, request))),
+              S.getResponseHeaders(LiftRules.defaultHeaders((xml, request))),
               S.responseCookies,
               request)
           }
@@ -1116,7 +1258,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
 
       case e: LiftFlowOfControlException => throw e
 
-      case e => NamedPF.applyBox((Props.mode, request, e), LiftRules.exceptionHandler.toList);
+      case e => S.runExceptionHandlers(request, e)
 
     }
 
@@ -1177,11 +1319,11 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   private[http] def attachRedirectFunc(uri: String, f: Box[() => Unit]) = {
     f map {
       fnc =>
-        val func: String = LiftSession.this.synchronized {
+        val func: String = {
           val funcName = Helpers.nextFuncName
-          messageCallback(funcName) = S.NFuncHolder(() => {
+          nmessageCallback.put(funcName, S.NFuncHolder(() => {
             fnc()
-          })
+          }))
           funcName
         }
         Helpers.appendFuncToURL(uri, func + "=_")
@@ -1238,23 +1380,6 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     }
   }
 
-  /*
-   * Given a Snippet name, try to determine the fully-qualified Class
-   * so that we can instantiate it via reflection.
-   */
-  private def findSnippetClass(name: String): Box[Class[AnyRef]] = {
-    if (name == null) Empty
-    else {
-      // Name might contain some relative packages, so split them out and put them in the proper argument of findClass
-      val (packageSuffix, terminal) = name.lastIndexOf('.') match {
-        case -1 => ("", name)
-        case i => ("." + name.substring(0, i), name.substring(i + 1))
-      }
-      findClass(terminal, LiftRules.buildPackage("snippet").map(_ + packageSuffix) :::
-        (("lift.app.snippet" + packageSuffix) :: ("net.liftweb.builtin.snippet" + packageSuffix) :: Nil))
-    }
-  }
-
   private def instantiateOrRedirect[T](c: Class[T]): Box[T] = {
     try {
       LiftSession.constructFrom(this,
@@ -1274,7 +1399,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
 
       first(LiftRules.snippetNamesToSearch.vend(cls)) {
         nameToTry =>
-          findSnippetClass(nameToTry) flatMap {
+          LiftSession.findSnippetClass(nameToTry) flatMap {
             clz =>
               instantiateOrRedirect(clz) flatMap {
                 inst =>
@@ -1347,25 +1472,27 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     } yield res
   }
 
-  private def processAttributes(in: MetaData): MetaData = {
+  private def processAttributes(in: MetaData, allow: Boolean): MetaData = {
+    if (!allow) in else {
     in match {
       case Null => Null
       case mine: PrefixedAttribute if (mine.pre == "lift") => {
         mine.key match {
-          case s if s.indexOf('.') > -1 => findAttributeSnippet(s, processAttributes(in.next), mine)
-          case "snippet" => findAttributeSnippet(mine.value.text, processAttributes(in.next))
-          case _ => mine.copy(processAttributes(in.next))
+          case s if s.indexOf('.') > -1 => findAttributeSnippet(s, processAttributes(in.next, allow), mine)
+          case "snippet" => findAttributeSnippet(mine.value.text, processAttributes(in.next, allow))
+          case _ => mine.copy(processAttributes(in.next, allow))
         }
       }
-      case notMine => notMine.copy(processAttributes(in.next))
+      case notMine => notMine.copy(processAttributes(in.next, allow))
     }
+  }
   }
 
   /**
    * See if there's a object singleton with the right name
    */
   private def findSnippetObject(cls: String): Box[AnyRef] =
-    findSnippetClass(cls + "$").flatMap {
+    LiftSession.findSnippetClass(cls + "$").flatMap {
       c =>
         tryo {
           val field = c.getField("MODULE$")
@@ -1387,7 +1514,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   private def findSnippetInstance(cls: String): Box[AnyRef] =
     S.snippetForClass(cls) or
       (LiftRules.snippet(cls) or
-        findSnippetClass(cls).flatMap(c => instantiateOrRedirect(c) or findSnippetObject(cls))) match {
+        LiftSession.findSnippetClass(cls).flatMap(c => instantiateOrRedirect(c) or findSnippetObject(cls))) match {
       case Full(inst: StatefulSnippet) =>
         inst.addName(cls); S.overrideSnippetForClass(cls, inst); Full(inst)
       case Full(ret) => Full(ret)
@@ -1403,6 +1530,14 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
                                  why: LiftRules.SnippetFailures.Value,
                                  addlMsg: NodeSeq,
                                  whole: NodeSeq): NodeSeq = {
+    (for {
+      nodeSeq <- S.currentSnippetNodeSeq if S.ignoreFailedSnippets
+    } yield {
+      // don't keep nailing the same snippet name if we just failed it
+      (snippetName or S.currentSnippet).foreach(s => _lastFoundSnippet.set(s))
+      nodeSeq
+    }) openOr {
+
     for {
       f <- LiftRules.snippetFailedFunc.toList
     } {
@@ -1428,6 +1563,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
           {whole.toString}
         </pre>
       </div>) openOr NodeSeq.Empty
+    }
   }
 
   private final def findNSAttr(attrs: MetaData, prefix: String, key: String): Option[Seq[Node]] =
@@ -1499,7 +1635,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
 
   def executeInScope[T](req: Box[Req], renderVersion: String)(f: => T): T = {
     def doExec(): T = {
-      RenderVersion.set(renderVersion)
+      RenderVersion.doWith(renderVersion) {
       try {
         f
       } finally {
@@ -1508,6 +1644,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             renderVersion, millis)
           S.clearFunctionMap
         }
+      }
       }
     }
 
@@ -1543,19 +1680,33 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             val ret = findSnippetInstance(nameToTry)
             // Update the snippetMap so that we reuse the same instance in this request (unless the snippet is transient)
             ret.filter(TransientSnippet.notTransient(_)).foreach(s => snippetMap.set(snippetMap.is.updated(tagName, s)))
-            
+
             ret
         }
       }
 
+    def runWhitelist(snippet: String, cls: String, method: String, kids: NodeSeq)(f: => NodeSeq): NodeSeq = {
+      val pf = LiftRules.snippetWhiteList.vend()
+      val pair = (cls, method)
+      if (pf.isDefinedAt(pair)) {
+        val func = pf(pair)
+        func.map(_.apply(kids)) openOr reportSnippetError(page, snippetName,
+                    LiftRules.SnippetFailures.MethodNotFound,
+                    NodeSeq.Empty,
+                    wholeTag)
+        } else f
+  }
+
     val ret: NodeSeq =
       try {
-        snippetName.map(snippet =>
+
+        snippetName.map{snippet =>
+          val (cls, method) = splitColonPair(snippet)
           S.doSnippet(snippet)(
-            (S.locateMappedSnippet(snippet).map(_(kids)) or
+            runWhitelist(snippet, cls, method, kids){(S.locateMappedSnippet(snippet).map(_(kids)) or
               locSnippet(snippet)).openOr(
               S.locateSnippet(snippet).map(_(kids)) openOr {
-                val (cls, method) = splitColonPair(snippet)
+
                 (locateAndCacheSnippet(cls)) match {
                   // deal with a stateless request when a snippet has
                   // different behavior in stateless mode
@@ -1685,7 +1836,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
                     wholeTag)
 
                 }
-              }))).openOr {
+              })})}.openOr {
           reportSnippetError(page, snippetName,
             LiftRules.SnippetFailures.NoNameSpecified,
             NodeSeq.Empty,
@@ -1697,7 +1848,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             e.snippetFailure,
             e.buildStackTrace,
             wholeTag)
-          
+
         case e: SnippetFailureException =>
           reportSnippetError(page, snippetName,
             e.snippetFailure,
@@ -1854,39 +2005,50 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     else f
   }
 
+  private object _lastFoundSnippet extends ThreadGlobal[String]
+
   /**
    * Processes the surround tag and other lift tags
+   *
+   * @param page the name of the page currently being processed
+   * @param in the DOM to process
    */
   def processSurroundAndInclude(page: String, in: NodeSeq): NodeSeq = {
-    in.flatMap {
-      case Group(nodes) =>
-        Group(processSurroundAndInclude(page, nodes))
+    try {
+      in.flatMap {
+        case Group(nodes) =>
+          Group(processSurroundAndInclude(page, nodes))
 
-      case SnippetNode(element, kids, isLazy, attrs, snippetName) =>
-        processOrDefer(isLazy) {
-          S.doSnippet(snippetName) {
-            S.withAttrs(attrs) {
-              processSurroundAndInclude(page,
-                NamedPF((snippetName,
-                  element, attrs,
-                  kids,
-                  page),
-                  liftTagProcessing))
+        case elem @ SnippetNode(element, kids, isLazy, attrs, snippetName) if snippetName != _lastFoundSnippet.value =>
+          processOrDefer(isLazy) {
+            S.withCurrentSnippetNodeSeq(elem) {
+              S.doSnippet(snippetName) {
+                S.withAttrs(attrs) {
+                  processSurroundAndInclude(page,
+                    NamedPF((snippetName,
+                      element, attrs,
+                      kids,
+                      page),
+                      liftTagProcessing))
+                }
+              }
             }
           }
-        }
 
-      case v: Elem =>
-        Elem(v.prefix, v.label, processAttributes(v.attributes),
-          v.scope, processSurroundAndInclude(page, v.child): _*)
+        case v: Elem =>
+          Elem(v.prefix, v.label, processAttributes(v.attributes, this.allowAttributeProcessing.is),
+            v.scope, processSurroundAndInclude(page, v.child): _*)
 
-      case pcd: scala.xml.PCData => pcd
-      case text: Text => text
-      case unparsed: Unparsed => unparsed
+        case pcd: scala.xml.PCData => pcd
+        case text: Text => text
+        case unparsed: Unparsed => unparsed
 
-      case a: Atom[Any] if (a.getClass == classOf[Atom[Any]]) => new Text(a.data.toString)
+        case a: Atom[Any] if (a.getClass == classOf[Atom[Any]]) => new Text(a.data.toString)
 
-      case v => v
+        case v => v
+      }
+    } finally {
+      _lastFoundSnippet.set(null)
     }
   }
 
@@ -1913,9 +2075,10 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   /**
    * Finds all Comet actors by type
    */
-  def findComet(theType: String): List[LiftCometActor] = synchronized {
+  def findComet(theType: String): List[LiftCometActor] = {
     testStatefulFeature {
-      asyncComponents.flatMap {
+      import scala.collection.JavaConversions._
+      nasyncComponents.flatMap {
         case ((Full(name), _), value) if name == theType => Full(value)
         case _ => Empty
       }.toList
@@ -1925,12 +2088,10 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   /**
    * Find the comet actor by type and name
    */
-  def findComet(theType: String, name: Box[String]): Box[LiftCometActor] = synchronized {
+  def findComet(theType: String, name: Box[String]): Box[LiftCometActor] =
     testStatefulFeature {
-      asyncComponents.get(Full(theType) -> name)
+      Box.legacyNullTest(nasyncComponents.get(Full(theType) -> name))
     }
-  }
-
 
   /**
    * This method will send a message to a CometActor, whether or not
@@ -1967,16 +2128,16 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
                                  attributes: Map[String, String]): Box[LiftCometActor] = {
     testStatefulFeature {
       val what = (theType -> name)
-      val ret = synchronized {
+      val ret = asyncSync.synchronized {
 
-        val ret = Box(asyncComponents.get(what)).or({
+        val ret = Box.legacyNullTest(nasyncComponents.get(what)).or({
           theType.flatMap {
             tpe =>
               val ret = findCometByType(tpe, name, defaultXml, attributes)
               ret.foreach(r =>
-                synchronized {
-                  asyncComponents(what) = r
-                  asyncById(r.uniqueId) = r
+                asyncSync.synchronized {
+                  nasyncComponents.put(what, r)
+                  nasyncById.put(r.uniqueId, r)
                 })
               ret
           }
@@ -2000,15 +2161,15 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   /**
    * Finds a Comet actor by ID
    */
-  def getAsyncComponent(id: String): Box[LiftCometActor] = synchronized(
-    testStatefulFeature(asyncById.get(id)))
+  def getAsyncComponent(id: String): Box[LiftCometActor] =
+    testStatefulFeature(Box.legacyNullTest(nasyncById.get(id)))
 
   /**
    * Adds a new Comet actor to this session
    */
-  private[http] def addCometActor(act: LiftCometActor): Unit = synchronized {
+  private[http] def addCometActor(act: LiftCometActor): Unit = {
     testStatefulFeature {
-      asyncById(act.uniqueId) = act
+      nasyncById.put(act.uniqueId, act)
     }
   }
 
@@ -2019,10 +2180,10 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
                                             attributes: Map[String, String]) = {
     testStatefulFeature {
       val what = (theType -> name)
-      synchronized {
-        asyncById(act.uniqueId) = act
-        asyncComponents(what) = act
-      }
+
+      nasyncById.put(act.uniqueId, act)
+      nasyncComponents.put(what, act)
+
       act.callInitCometActor(this, theType, name, defaultXml, attributes)
       act ! PerformSetupComet2(if (act.sendInitialReq_?)
         S.request.map(_.snapshot)
@@ -2033,29 +2194,34 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   /**
    * Remove a Comet actor
    */
-  private[http] def removeCometActor(act: LiftCometActor): Unit = synchronized {
+  private[http] def removeCometActor(act: LiftCometActor): Unit =  {
     testStatefulFeature {
-      asyncById -= act.uniqueId
-      messageCallback -= act.jsonCall.funcId
-      asyncComponents -= (act.theType -> act.name)
+      nasyncById.remove(act.uniqueId)
+      nasyncComponents.remove(act.theType -> act.name)
 
       val toCmp = Full(act.uniqueId)
 
-      messageCallback.foreach {
+      import scala.collection.JavaConversions._
+      nmessageCallback.remove(act.jsonCall.funcId)
+      nmessageCallback.foreach {
         case (k, f) =>
-          if (f.owner == toCmp) messageCallback -= k
+          if (f.owner == toCmp) nmessageCallback.remove(k)
       }
 
-      accessPostPageFuncs {
-        postPageFunctions -= act.uniqueId
+      LiftSession.this.synchronized {
+        accessPostPageFuncs {
+          postPageFunctions -= act.uniqueId
+        }
       }
+
 
       val id = Full(act.uniqueId)
-      messageCallback.keys.toList.foreach {
-        k =>
-          val f = messageCallback(k)
+
+      nmessageCallback.foreach {
+        case (k, f) =>
+
           if (f.owner == id) {
-            messageCallback -= k
+            nmessageCallback.remove(k)
           }
       }
     }
@@ -2149,7 +2315,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
             case (id, replacement) => (("#" + id) #> replacement)
           }.reduceLeft(_ & _)(s)
         }
-      case _ => atWhat.values.flatMap(_.toSeq).toList
+      case _ => atWhat.valuesIterator.toSeq.flatMap(_.toSeq).toList
     }
   }
 

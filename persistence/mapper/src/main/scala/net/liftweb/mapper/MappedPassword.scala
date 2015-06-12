@@ -32,6 +32,12 @@ import net.liftweb.http.js._
 
 object MappedPassword {
   val blankPw = "*******"
+
+  /**
+   * Set this in boot if you want Bcrypt salt strength to be
+   * something more than the default
+   */
+  var bcryptStrength: Box[Int] = None
 }
 
 abstract class MappedPassword[T<:Mapper[T]](val fieldOwner: T)
@@ -51,16 +57,20 @@ extends MappedField[String, T] {
   def salt = this.salt_i
 
   private var password = FatLazy(defaultValue)
-  private val salt_i = FatLazy(Safe.randomString(16))
+  private val salt_i = FatLazy(util.Safe.randomString(16))
   private var invalidPw = false
   private var invalidMsg = ""
 
   protected def real_i_set_!(value : String) : String = {
-    password() = value match {
-      case "*" | null | MappedPassword.blankPw if (value.length < 3) => {invalidPw = true ; invalidMsg = S.??("password.must.be.set") ; "*"}
-      case MappedPassword.blankPw => {return "*"}
-      case _ if (value.length > 4) => {invalidPw = false; hash("{"+value+"} salt={"+salt_i.get+"}")}
-      case _ => {invalidPw = true ; invalidMsg = S.??("password.too.short"); "*"}
+    value match {
+      case "*" | null | MappedPassword.blankPw if (value.length < 3) =>
+       invalidPw = true ; invalidMsg = S.?("password.must.be.set") ; password.set("*")
+      case MappedPassword.blankPw => return "*"
+      case _ if (value.length > 4) => invalidPw = false;
+      val bcrypted = BCrypt.hashpw(value, MappedPassword.bcryptStrength.map(BCrypt.gensalt(_)) openOr BCrypt.gensalt())
+      password.set("b;"+bcrypted.substring(0,44))
+      salt_i.set(bcrypted.substring(44))
+      case _ => invalidPw = true ; invalidMsg = S.?("password.too.short"); password.set("*")
     }
     this.dirty_?( true)
     "*"
@@ -69,7 +79,7 @@ extends MappedField[String, T] {
   def setList(in: List[String]): Boolean =
   in match {
     case x1 :: x2 :: Nil if x1 == x2 => this.set(x1) ; true
-    case _ => invalidPw = true; invalidMsg = S.??("passwords.do.not.match"); false
+    case _ => invalidPw = true; invalidMsg = S.?("passwords.do.not.match"); false
   }
 
 
@@ -77,7 +87,7 @@ extends MappedField[String, T] {
     f match {
       case a : Array[String] if (a.length == 2 && a(0) == a(1)) => {this.set(a(0))}
       case l : List[String] if (l.length == 2 && l.head == l(1)) => {this.set(l.head)}
-      case _ => {invalidPw = true; invalidMsg = S.??("passwords.do.not.match")}
+      case _ => {invalidPw = true; invalidMsg = S.?("passwords.do.not.match")}
     }
     is
   }
@@ -86,17 +96,26 @@ extends MappedField[String, T] {
 
   def asJsExp: JsExp = throw new NullPointerException("No way")
 
-  def match_?(toMatch : String) = {
+  /**
+   * Test to see if an incoming password matches
+   * @param toMatch the password to test
+   * @return the matched value
+   */
+  def match_?(toMatch : String): Boolean = {
+    if (password.get.startsWith("b;")) {
+      BCrypt.checkpw(toMatch, password.get.substring(2)+salt_i.get)
+    } else
     hash("{"+toMatch+"} salt={"+salt_i.get+"}") == password.get
   }
 
   override def validate : List[FieldError] = {
     if (!invalidPw && password.get != "*") Nil
     else if (invalidPw) List(FieldError(this, Text(invalidMsg)))
-    else List(FieldError(this, Text(S.??("password.must.be.set"))))
+    else List(FieldError(this, Text(S.?("password.must.be.set"))))
   }
 
-  def real_convertToJDBCFriendly(value: String): Object = hash("{"+value+"} salt={"+salt_i.get+"}")
+  def real_convertToJDBCFriendly(value: String): Object =
+    BCrypt.hashpw(value, MappedPassword.bcryptStrength.map(BCrypt.gensalt(_)) openOr BCrypt.gensalt())
 
   /**
    * Get the JDBC SQL Type for this field
@@ -124,7 +143,7 @@ extends MappedField[String, T] {
   override def _toForm: Box[NodeSeq] = {
     S.fmapFunc({s: List[String] => this.setFromAny(s)}){funcName =>
       Full(<span>{appendFieldId(<input type={formInputType} name={funcName}
-            value={is.toString}/>)}&nbsp;{S.??("repeat")}&nbsp;<input
+            value={is.toString}/>)}&nbsp;{S.?("repeat")}&nbsp;<input
             type={formInputType} name={funcName}
             value={is.toString}/></span>)
     }

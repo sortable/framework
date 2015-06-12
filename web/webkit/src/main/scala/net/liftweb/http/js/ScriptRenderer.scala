@@ -20,6 +20,8 @@ package js
 
 import net.liftweb.http._
 import net.liftweb.common._
+import net.liftweb.util.Props
+import net.liftweb.http.js.JE.JsVar
 
 /**
  * the default mechanisms for doing Ajax and Comet in Lift
@@ -46,6 +48,18 @@ object ScriptRenderer {
 	  toSend.onSuccess = theSuccess;
 	  toSend.onFailure = theFailure;
 	  toSend.responseType = responseType;
+	  toSend.version = liftAjax.lift_ajaxVersion++;
+
+      // Make sure we wrap when we hit JS max int.
+      var version = liftAjax.lift_ajaxVersion
+      if ((version - (version + 1) != -1) || (version - (version - 1) != 1))
+        liftAjax.lift_ajaxVersion = 0;
+
+	  if (liftAjax.lift_uriSuffix) {
+	    theData += '&' + liftAjax.lift_uriSuffix;
+	    toSend.theData = theData;
+	    liftAjax.lift_uriSuffix = undefined;
+	  }
 
 	  liftAjax.lift_ajaxQueue.push(toSend);
 	  liftAjax.lift_ajaxQueueSort();
@@ -57,6 +71,17 @@ object ScriptRenderer {
 
     lift_uriSuffix: undefined,
 
+    lift_logError: function(msg) {
+      """ + (LiftRules.jsLogFunc.map(_(JsVar("msg")).toJsCmd) openOr "") + """
+    },
+
+    lift_defaultLogError: function(msg) {
+      if (console && typeof console.error == 'function')
+        console.error(msg);
+      else
+        alert(msg);
+    },
+    
     lift_ajaxQueueSort: function() {
       liftAjax.lift_ajaxQueue.sort(function (a, b) {return a.when - b.when;});
     },
@@ -102,7 +127,8 @@ object ScriptRenderer {
     },
 
     lift_registerGC: function() {
-      var data = "__lift__GC=_"
+      var data = "__lift__GC=_",
+          version = null;
       """ + LiftRules.jsArtifacts.ajax(AjaxInfo(JE.JsRaw("data"),
     "POST",
     LiftRules.ajaxPostTimeout,
@@ -110,6 +136,11 @@ object ScriptRenderer {
     Full("liftAjax.lift_successRegisterGC"), Full("liftAjax.lift_failRegisterGC"))) +
           """
        },
+
+
+      lift_sessionLost: function() {
+        location.reload();
+      },
 
        lift_doAjaxCycle: function() {
          if (liftAjax.lift_doCycleQueueCnt > 0) liftAjax.lift_doCycleQueueCnt--;
@@ -132,9 +163,17 @@ object ScriptRenderer {
 
              var failureFunc = function() {
                liftAjax.lift_ajaxInProcess = null;
-               var cnt = aboutToSend.retryCnt;
+               var cnt = aboutToSend.retryCnt;""" +
+               (if (!Props.devMode) "" else 
+  """
+               if (arguments.length == 3 && arguments[1] == 'parsererror') {
+                 liftAjax.lift_logError('The server call succeeded, but the returned Javascript contains an error: '+arguments[2])
+               } else
+  """) + 
+
+            """
                if (cnt < liftAjax.lift_ajaxRetryCount) {
-               aboutToSend.retryCnt = cnt + 1;
+                 aboutToSend.retryCnt = cnt + 1;
                  var now = (new Date()).getTime();
                  aboutToSend.when = now + (1000 * Math.pow(2, cnt));
                  queue.push(aboutToSend);
@@ -155,12 +194,10 @@ object ScriptRenderer {
                  aboutToSend.responseType.toLowerCase() === "json") {
                liftAjax.lift_actualJSONCall(aboutToSend.theData, successFunc, failureFunc);
              } else {
-               var theData = aboutToSend.theData;
-               if (liftAjax.lift_uriSuffix) {
-                 theData += '&' + liftAjax.lift_uriSuffix;
-                 liftAjax.lift_uriSuffix = undefined;
-               }
-               liftAjax.lift_actualAjaxCall(theData, successFunc, failureFunc);
+               var theData = aboutToSend.theData,
+                   version = aboutToSend.version;
+
+               liftAjax.lift_actualAjaxCall(theData, version, successFunc, failureFunc);
              }
             }
          }
@@ -174,17 +211,22 @@ object ScriptRenderer {
          setTimeout("liftAjax.lift_doAjaxCycle();", 200);
        },
 
-       addPageName: function(url) {
-         return """ + {
-    if (LiftRules.enableLiftGC) {
-      "url.replace('" + LiftRules.ajaxPath + "', '" + LiftRules.ajaxPath + "/'+lift_page);"
+       lift_ajaxVersion: 0,
+
+       addPageNameAndVersion: function(url, version) {
+         """ + {
+    if (LiftRules.enableLiftGC) { """
+      var replacement = '""" + LiftRules.ajaxPath + """/'+lift_page;
+      if (version!=null)
+        replacement += ('-'+version.toString(36)) + (liftAjax.lift_ajaxQueue.length > 35 ? 35 : liftAjax.lift_ajaxQueue.length).toString(36);
+      return url.replace('""" + LiftRules.ajaxPath + """', replacement);"""
     } else {
-      "url;"
+      "return url;"
     }
   } + """
     },
 
-    lift_actualAjaxCall: function(data, onSuccess, onFailure) {
+    lift_actualAjaxCall: function(data, version, onSuccess, onFailure) {
       """ +
           LiftRules.jsArtifacts.ajax(AjaxInfo(JE.JsRaw("data"),
             "POST",
@@ -195,6 +237,7 @@ object ScriptRenderer {
         },
 
         lift_actualJSONCall: function(data, onSuccess, onFailure) {
+          var version = null;
           """ +
           LiftRules.jsArtifacts.ajax(AjaxInfo(JE.JsRaw("data"),
             "POST",
@@ -250,6 +293,17 @@ object ScriptRenderer {
       lift_handlerFailureFunc: function() {
         setTimeout("liftComet.lift_cometEntry();",""" + LiftRules.cometFailureRetryTimeout + """);
       },
+
+
+      lift_cometError: function(e) {
+        if (console && typeof console.error == 'function')
+          console.error(e.stack || e);
+        throw e;
+      },
+
+      lift_sessionLost: function() { """ +
+        JsCmds.RedirectTo(LiftRules.noCometSessionPage).toJsCmd +
+      """},
 
       lift_cometEntry: function() {
         var isEmpty = function(){for (var i in lift_toWatch) {return false} return true}();

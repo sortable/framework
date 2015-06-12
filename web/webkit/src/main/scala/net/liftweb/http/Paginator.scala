@@ -164,9 +164,9 @@ trait PaginatorSnippet[T] extends Paginator[T] {
    */
   def currentXml: NodeSeq = 
     if(count==0)
-      Text(??("paginator.norecords"))
+      Text(S.?("paginator.norecords"))
     else
-      Text(??("paginator.displayingrecords", 
+      Text(S.?("paginator.displayingrecords",
               Array(recordsFrom, recordsTo, count).map(_.asInstanceOf[AnyRef]) : _*))
 
   /**
@@ -190,7 +190,10 @@ trait PaginatorSnippet[T] extends Paginator[T] {
   /**
    * Returns a URL used to link to a page starting at the given record offset.
    */
-  def pageUrl(offset: Long): String = appendParams(S.uri, List(offsetParam -> offset.toString))
+  def pageUrl(offset: Long): String = {
+    def originalUri = S.originalRequest.map(_.uri).openOr(sys.error("No request"))
+    appendParams(originalUri, List(offsetParam -> offset.toString))
+  }
   /**
    * Returns XML that links to a page starting at the given record offset, if the offset is valid and not the current one.
    * @param ns The link text, if the offset is valid and not the current offset; or, if that is not the case, the static unlinked text to display

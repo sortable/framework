@@ -14,15 +14,22 @@
  * limitations under the License.
  */
 
-package net.liftweb 
-package util 
+package net.liftweb
+package util
 
-import org.apache.commons.codec.binary.Base64
-import java.io.{InputStream, ByteArrayOutputStream, ByteArrayInputStream, Reader, File, FileInputStream, BufferedReader}
-import java.security.{SecureRandom, MessageDigest}
+import java.io._
+import java.security._
 import javax.crypto._
 import javax.crypto.spec._
-import scala.xml.{Node, XML}
+import javax.xml.parsers.SAXParserFactory
+import javax.xml.XMLConstants
+
+import scala.xml.{Elem, XML}
+import scala.xml.factory.XMLLoader
+
+import org.apache.commons.codec.binary.Base64
+import org.apache.xerces.impl.Constants
+
 import common._
 
 object SecurityHelpers extends StringHelpers with IoHelpers with SecurityHelpers
@@ -35,20 +42,20 @@ object SecurityHelpers extends StringHelpers with IoHelpers with SecurityHelpers
  * <li> create SHA, SHA-256, MD5 hashs (can be hex encoded)
  * </ul>
  */
-trait SecurityHelpers { 
-  self: StringHelpers with IoHelpers => 
+trait SecurityHelpers {
+  self: StringHelpers with IoHelpers =>
 
   /** short alias for java.security.SecureRandom */
   private val _random = new SecureRandom
 
-  private def withRandom[T](f: SecureRandom => T): T = 
+  private def withRandom[T](f: SecureRandom => T): T =
     _random.synchronized(f(_random))
 
   /** return a random Long modulo a number */
-  def randomLong(mod: Long): Long = withRandom(random => Math.abs(random.nextLong) % mod)
+  def randomLong(mod: Long): Long = withRandom(random => math.abs(random.nextLong) % mod)
 
   /** return a random int modulo a number */
-  def randomInt(mod: Int): Int = withRandom(random => Math.abs(random.nextInt) % mod)
+  def randomInt(mod: Int): Int = withRandom(random => math.abs(random.nextInt) % mod)
 
   /**
    * return true only 'percent' times when asked repeatedly.
@@ -69,19 +76,19 @@ trait SecurityHelpers {
   def base64Decode(in: String): Array[Byte] = (new Base64).decode(in.getBytes("UTF-8"))
 
   /** create a MD5 digest from a Byte array */
-  def md5(in: Array[Byte]): Array[Byte] = (MessageDigest.getInstance("MD5")).digest(in)
+  def md5(in: Array[Byte]): Array[Byte] = MessageDigest.getInstance("MD5").digest(in)
 
   /** create a MD5 digest from a String */
-  def md5(in: String): String = new String(cleanArray((new Base64) encode md5(in.getBytes("UTF-8"))))
+  def md5(in: String): String = base64Encode(md5(in.getBytes("UTF-8")))
 
   /** create a SHA hash from a Byte array */
   def hash(in : Array[Byte]) : Array[Byte] = {
-    (MessageDigest.getInstance("SHA")).digest(in)
+    MessageDigest.getInstance("SHA").digest(in)
   }
 
   /** create a SHA hash from a String */
   def hash(in: String) : String = {
-    new String(cleanArray((new Base64) encode (MessageDigest.getInstance("SHA")).digest(in.getBytes("UTF-8"))))
+    base64Encode(MessageDigest.getInstance("SHA").digest(in.getBytes("UTF-8")))
   }
 
    /** create a SHA hash from a String */
@@ -98,7 +105,7 @@ trait SecurityHelpers {
     case (_, null) => false
     case (a, b) => secureEquals(a.getBytes("UTF-8"), b.getBytes("UTF-8"))
   }
-    
+
   /** Compare two byte arrays in a way that does not vary if the arrays
    * are determined to be not equal early (test every byte... avoids
    * timing attackes */
@@ -118,27 +125,27 @@ trait SecurityHelpers {
       ret && la == lb
     }
   }
-    
+
 
   /** create a SHA-256 hash from a Byte array */
   def hash256(in : Array[Byte]) : Array[Byte] = {
-    (MessageDigest.getInstance("SHA-256")).digest(in)
+    MessageDigest.getInstance("SHA-256").digest(in)
   }
 
   /** create a SHA-256 hash from a String */
   def hash256(in : String): String = {
-    new String(cleanArray((new Base64) encode (MessageDigest.getInstance("SHA-256")).digest(in.getBytes("UTF-8"))))
+    base64Encode(MessageDigest.getInstance("SHA-256").digest(in.getBytes("UTF-8")))
   }
 
   /** create an hex encoded SHA hash from a Byte array */
   def hexDigest(in: Array[Byte]): String = {
-    val binHash = (MessageDigest.getInstance("SHA")).digest(in)
+    val binHash = MessageDigest.getInstance("SHA").digest(in)
     hexEncode(binHash)
   }
 
   /** create an hex encoded SHA-256 hash from a Byte array */
   def hexDigest256(in: Array[Byte]): String = {
-    val binHash = (MessageDigest.getInstance("SHA-256")).digest(in)
+    val binHash = MessageDigest.getInstance("SHA-256").digest(in)
     hexEncode(binHash)
   }
 
@@ -197,5 +204,28 @@ trait SecurityHelpers {
     sb.toString
   }
 
-}
+  /**
+   * Provides a secure XML parser, similar to the one provided by
+   * `scala.xml.XML`, but with external entities and doctypes disabled and
+   * secure XML processing enabled. This prevents XXE (XML External Entities)
+   * attacks, billion laughs attacks, quadratic blowup attacks, and others. It
+   * is used internally throughout Lift, and should be used by anyone who is
+   * parsing XML from an untrusted source.
+   */
+  def secureXML: XMLLoader[Elem] = {
+    val parserFactory =
+      SAXParserFactory.newInstance(
+        "org.apache.xerces.jaxp.SAXParserFactoryImpl",
+        SecurityHelpers.getClass.getClassLoader
+      )
 
+    parserFactory.setNamespaceAware(false)
+    parserFactory.setFeature(Constants.SAX_FEATURE_PREFIX + Constants.EXTERNAL_GENERAL_ENTITIES_FEATURE, false)
+    parserFactory.setFeature(Constants.SAX_FEATURE_PREFIX + Constants.EXTERNAL_PARAMETER_ENTITIES_FEATURE, false)
+    parserFactory.setFeature(Constants.XERCES_FEATURE_PREFIX + Constants.DISALLOW_DOCTYPE_DECL_FEATURE, true)
+    parserFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+
+    val saxParser = parserFactory.newSAXParser()
+    XML.withSAXParser(saxParser)
+  }
+}

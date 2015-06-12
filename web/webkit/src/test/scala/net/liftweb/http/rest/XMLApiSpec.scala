@@ -20,16 +20,18 @@ package rest
 
 import xml._
 
-import org.specs.Specification
-import org.specs.matcher.Matcher
+import org.specs2.mutable.Specification
+import org.specs2.matcher.Matcher
 
 import common._
+import util.Helpers.secureXML
 import util.ControlHelpers.tryo
 
 /**
  * System under specification for XMLApi.
  */
-object XmlApiSpec extends Specification("XMLApi Specification") {
+object XmlApiSpec extends Specification  {
+  "XMLApi Specification".title
 
   object XMLApiExample extends XMLApiHelper {
     // Define our root tag
@@ -83,17 +85,18 @@ object XmlApiSpec extends Specification("XMLApi Specification") {
 
   // A helper to simplify the specs matching
   case class matchXmlResponse(expected : Node) extends Matcher[LiftResponse] {
-    def apply (response : => LiftResponse) = response match {
+    def apply[T <: LiftResponse](response : org.specs2.matcher.Expectable[T]) = response.value match {
       case x : XmlResponse => {
         /* For some reason, the UnprefixedAttributes that Lift uses to merge in
          * new attributes makes comparison fail. Instead, we simply stringify and
          * reparse the response contents and that seems to fix the issue. */
-        val converted = XML.loadString(x.xml.toString)
-        (converted == expected, 
+        val converted = secureXML.loadString(x.xml.toString)
+        result(converted == expected, 
          "%s matches %s".format(converted,expected),
-         "%s does not match %s".format(converted, expected))
+         "%s does not match %s".format(converted, expected),
+         response)
       }
-      case other => (false,"matches","not an XmlResponse")
+      case other => result(false,"matches","not an XmlResponse", response)
     }
   }
 

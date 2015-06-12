@@ -382,7 +382,7 @@ trait MetaMapper[A<:Mapper[A]] extends BaseMetaMapper with Mapper[A] {
    * @param conn -- the SuperConnection to be used for calculating the query
    * @param by -- the varg of QueryParams
    *
-   * @returns a Tuple of the Query String, Start (offset), MaxRows (limit), and the list of all query parameters
+   * @return a Tuple of the Query String, Start (offset), MaxRows (limit), and the list of all query parameters
    * including and synthetic query parameters
    */
   def buildSelectString(fields: Seq[SelectableField], conn: SuperConnection, by: QueryParam[A]*):
@@ -869,7 +869,7 @@ trait MetaMapper[A<:Mapper[A]] extends BaseMetaMapper with Mapper[A] {
             val ret = if (saved_?(toSave)) {
               _beforeUpdate(toSave)
               val ret: Boolean = if (!dirty_?(toSave)) true else {
-                val ret: Boolean = DB.prepareStatement("UPDATE "+MapperRules.quoteTableName.vend(_dbTableNameLC)+" SET "+whatToSet(toSave)+" WHERE "+thePrimaryKeyField.open_! +" = ?", conn) {
+                val ret: Boolean = DB.prepareStatement("UPDATE "+MapperRules.quoteTableName.vend(_dbTableNameLC)+" SET "+whatToSet(toSave)+" WHERE "+thePrimaryKeyField.openOrThrowException("Cross your fingers") +" = ?", conn) {
                   st =>
                   var colNum = 1
 
@@ -1083,7 +1083,7 @@ trait MetaMapper[A<:Mapper[A]] extends BaseMetaMapper with Mapper[A] {
    * A partial function that takes an instance of A and a field name and returns the mapped field
    */
   lazy val fieldMatcher: PartialFunction[(A, String), MappedField[Any, A]] = {
-    case (actual, fieldName) if _mappedFields.contains(fieldName) => fieldByName[Any](fieldName, actual).open_! // we know this is defined
+    case (actual, fieldName) if _mappedFields.contains(fieldName) => fieldByName[Any](fieldName, actual).openOrThrowException("we know this is defined")
   }
 
   def createInstance: A = rootClass.newInstance.asInstanceOf[A]
@@ -1347,7 +1347,7 @@ trait MetaMapper[A<:Mapper[A]] extends BaseMetaMapper with Mapper[A] {
 
     val conn = DB.currentConnection
     if (conn.isDefined) {
-      val rc = conn.open_!
+      val rc = conn.openOrThrowException("We just checked that this is a Full Box")
       if (rc.metaData.storesMixedCaseIdentifiers) name
       else name.toLowerCase
     } else name
@@ -1363,8 +1363,7 @@ trait MetaMapper[A<:Mapper[A]] extends BaseMetaMapper with Mapper[A] {
 
       case pcf =>
         if (!inst.addedPostCommit) {
-          DB.appendPostFunc(inst.connectionIdentifier,
-                            () => (clearPCFunc :: pcf).foreach(_(inst)))
+          DB.appendPostTransaction(inst.connectionIdentifier, dontUse =>  (clearPCFunc :: pcf).foreach(_(inst)))
           inst.addedPostCommit = true
         }
     }
@@ -1786,17 +1785,25 @@ trait KeyedMetaMapper[Type, A<:KeyedMapper[Type, A]] extends MetaMapper[A] with 
   def asSafeJs(actual: A, f: KeyObfuscator): JsExp = {
     val pk = actual.primaryKeyField
     val first = (pk.name, JE.Str(f.obscure(self, pk.is)))
-    JE.JsObj(first :: ("$lift_class", JE.Str(dbTableName)) :: mappedFieldList.
-             map(f => this.??(f.method, actual)).
-             filter(f => !f.dbPrimaryKey_? && f.renderJs_?).flatMap{
-        case fk:  Q =>
-          val key = f.obscure(fk.dbKeyToTable, fk.is)
-          List((fk.name, JE.Str(key)),
-               (fk.name+"_obj",
-                JE.AnonFunc("index", JE.JsRaw("return index["+key.encJs+"];").cmd)))
-
-        case x => x.asJs}.toList :::
-             actual.suplementalJs(Full(f)) :_*)
+    JE.JsObj(
+      first ::
+        ("$lift_class", JE.Str(dbTableName)) ::
+        mappedFieldList
+          .map(f => this.??(f.method, actual))
+          .filter(f => !f.dbPrimaryKey_? && f.renderJs_?)
+          .flatMap{
+            case fk0: MappedForeignKey[_, _, _] with MappedField[_, _] =>
+              val fk = fk0.asInstanceOf[Q]
+              val key = f.obscure(fk.dbKeyToTable, fk.is)
+              List(
+                (fk.name, JE.Str(key)),
+                (fk.name+"_obj", JE.AnonFunc("index", JE.JsRaw("return index["+key.encJs+"];").cmd))
+              )
+            case x => x.asJs
+          }
+          .toList :::
+        actual.suplementalJs(Full(f)) : _*
+    )
   }
 
   private def convertToQPList(prod: Product): Array[QueryParam[A]] = {
@@ -2036,7 +2043,7 @@ trait KeyedMetaMapper[Type, A<:KeyedMapper[Type, A]] extends MetaMapper[A] with 
    * @return a mapped object of this metamapper's type
    */
   def editSnippetSetup: A = {
-    objFromIndexedParam.open_!
+    objFromIndexedParam.openOrThrowException("Comment says this is broken")
   }
   /**
    * Default setup behavior for the view snippet. BROKEN! MUST OVERRIDE IF
@@ -2045,7 +2052,7 @@ trait KeyedMetaMapper[Type, A<:KeyedMapper[Type, A]] extends MetaMapper[A] with 
    * @return a mapped object of this metamapper's type
    */
   def viewSnippetSetup: A = {
-    objFromIndexedParam.open_!
+    objFromIndexedParam.openOrThrowException("Comment says this is broken")
   }
   /**
    * Default callback behavior of the edit snippet. Called when the user

@@ -17,7 +17,7 @@
 package net.liftweb
 package webapptest
 
-import org.specs.Specification
+import org.specs2.mutable.Specification
 
 import util._
 import http._
@@ -31,6 +31,7 @@ import snippet.Counter
 
 
 object OneShot extends Specification with RequestKit {
+  sequential
 
   private def reachableLocalAddress = {
     val l = InetAddress.getLocalHost
@@ -49,12 +50,9 @@ object OneShot extends Specification with RequestKit {
 
   def baseUrl = jetty.baseUrl.toString
 
-  doBeforeSpec(jetty.start())
+  step(jetty.start())
 
   "ContainerVars" should {
-
-    setSequential()
-
     "have correct int default" in {
       val tmp = LiftRules.sessionCreator
       try {
@@ -66,7 +64,7 @@ object OneShot extends Specification with RequestKit {
             xml <- resp.xml
           } yield xml
         
-        bx.open_! must ==/ (<int>45</int>).when(jetty.running)
+        bx.openOrThrowException("legacy code") must ==/ (<int>45</int>).when(jetty.running)
       } finally {
         LiftRules.sessionCreator = tmp
       }
@@ -84,7 +82,7 @@ object OneShot extends Specification with RequestKit {
           xml <- resp2.xml
         } yield xml
 
-      bx.open_! must ==/ (<int>33</int>).when(jetty.running)
+      bx.openOrThrowException("legacy code") must ==/ (<int>33</int>).when(jetty.running)
       } finally {
         LiftRules.sessionCreator = tmp
       }
@@ -104,8 +102,8 @@ object OneShot extends Specification with RequestKit {
           xml2 <- resp3.xml
         } yield (xml, xml2)
 
-      bx.open_!._1 must ==/ (<int>33</int>).when(jetty.running)
-      bx.open_!._2 must ==/ (<int>45</int>).when(jetty.running)
+      bx.openOrThrowException("legacy code")._1 must ==/ (<int>33</int>).when(jetty.running)
+      bx.openOrThrowException("legacy code")._2 must ==/ (<int>45</int>).when(jetty.running)
       } finally {
         LiftRules.sessionCreator = tmp
       }
@@ -126,8 +124,8 @@ object OneShot extends Specification with RequestKit {
             xml2 <- resp3.xml
           } yield (xml, xml2)
 
-        bx.open_!._1 must ==/(<int>33</int>).when(jetty.running)
-        bx.open_!._2 must ==/(<str>meow</str>).when(jetty.running)
+        bx.openOrThrowException("legacy code")._1 must ==/(<int>33</int>).when(jetty.running)
+        bx.openOrThrowException("legacy code")._2 must ==/(<str>meow</str>).when(jetty.running)
 
       } finally {
         LiftRules.sessionCreator = tmp
@@ -136,9 +134,6 @@ object OneShot extends Specification with RequestKit {
   }
 
   "OneShot" should {
-
-    setSequential()
-
     "fire once for oneshot" in {
       Counter.x = 0
 
@@ -175,7 +170,7 @@ object OneShot extends Specification with RequestKit {
     }
   }
 
-  doAfterSpec {
+  step {
     tryo {
       jetty.stop()
     }

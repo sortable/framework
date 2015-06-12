@@ -66,8 +66,7 @@ trait MixableMappedField extends BaseField {
  * The base (not Typed) trait that defines a field that is mapped to a column or more than 1 column
  * (e.g., MappedPassword) in the database
  */
-@serializable
-trait BaseMappedField extends SelectableField with Bindable with MixableMappedField {
+trait BaseMappedField extends SelectableField with Bindable with MixableMappedField with Serializable{
 
   def dbDisplay_? = true
 
@@ -141,11 +140,11 @@ trait BaseMappedField extends SelectableField with Bindable with MixableMappedFi
     val name = dbColumnName
 
     val conn = DB.currentConnection
-    if (conn.isDefined) {
-      val rc = conn.open_!
-      if (rc.metaData.storesMixedCaseIdentifiers) name
-      else name.toLowerCase
-    } else name
+    conn.map{
+      c =>
+        if (c.metaData.storesMixedCaseIdentifiers) name
+        else name.toLowerCase
+    }.openOr(name)
   }
 
   /**
@@ -450,7 +449,7 @@ trait MappedField[FieldType <: Any,OwnerType <: Mapper[OwnerType]] extends Typed
 
 
   def toForm: Box[NodeSeq] = {
-    def mf(in: Node): NodeSeq = in match {
+    def mf(in: scala.xml.Node): NodeSeq = in match {
       case g: Group => g.nodes.flatMap(mf)
       case e: Elem => e % toFormAppendedAttributes
       case other => other
@@ -691,10 +690,11 @@ trait MappedField[FieldType <: Any,OwnerType <: Mapper[OwnerType]] extends Typed
     case _ => false
   }
 
-  override def asHtml : Node = Text(toString)
+  override def asHtml: scala.xml.Node = Text(toString)
 }
 
 object MappedField {
+  @deprecated("Automatic conversion to the field's type is not safe and will be removed. Please use field.get instead", "2.5")
   implicit def mapToType[T, A<:Mapper[A]](in : MappedField[T, A]): T = in.is
 }
 

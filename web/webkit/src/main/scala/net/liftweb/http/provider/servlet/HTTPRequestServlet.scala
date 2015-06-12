@@ -158,9 +158,9 @@ class HTTPRequestServlet(val req: HttpServletRequest, val provider: HTTPProvider
   def resumeInfo : Option[(Req, LiftResponse)] = asyncProvider.flatMap(_.resumeInfo)
 
   
-  def suspend(timeout: Long): RetryState.Value = asyncProvider.open_!.suspend(timeout) // open_! is bad, but presumably, the suspendResume support was checked
+  def suspend(timeout: Long): RetryState.Value = asyncProvider.openOrThrowException("open_! is bad, but presumably, the suspendResume support was checked").suspend(timeout)
 
-  def resume(what: (Req, LiftResponse)): Boolean = asyncProvider.open_!.resume(what)
+  def resume(what: (Req, LiftResponse)): Boolean = asyncProvider.openOrThrowException("open_! is bad, but presumably, the suspendResume support was checked").resume(what)
 
   lazy val suspendResumeSupport_? = {
     LiftRules.asyncProviderMeta.
@@ -226,7 +226,10 @@ private class OfflineRequestSnapshot(req: HTTPRequest, val provider: HTTPProvide
 
   val scheme: String = req.scheme
 
-  val serverPort: Int = req.serverPort
+  lazy val serverPort: Int = req.serverPort match {
+    case 80 => headers("X-SSL").flatMap(Helpers.asBoolean _).filter(a => a).map(a => 443).headOption getOrElse 80
+    case x => x
+  }
 
   val method: String = req.method
 

@@ -17,8 +17,10 @@
 package net.liftweb
 package builtin.snippet
 
+import net.liftweb.util.Helpers
+
 import xml._
-import org.specs.Specification
+import org.specs2.mutable.Specification
 
 import common._
 import http._
@@ -27,7 +29,9 @@ import http._
 /**
  * System under specification for Msg.
  */
-object MsgSpec extends Specification("Msg Specification") {
+object MsgSpec extends Specification  {
+  "Msg Specification".title
+
   def withSession[T](f: => T) : T =
     S.initIfUninitted(new LiftSession("test", "", Empty))(f)
 
@@ -41,15 +45,28 @@ object MsgSpec extends Specification("Msg Specification") {
 
         // We reparse due to inconsistencies with UnparsedAttributes
         val result = S.withAttrs(new UnprefixedAttribute("id", Text("foo"), new UnprefixedAttribute("noticeClass", Text("funky"), Null))) {
-          XML.loadString(Msg.render(<div/>).toString)
+          Helpers.secureXML.loadString(Msg.render(<div/>).toString)
         }
-        
+
         result must ==/(<span id="foo">Error, <span class="funky">Notice</span></span>)
       }
     }
 
     "Properly render AJAX content for a given id" in {
-      // TODO : Figure out how to test this
+       withSession {
+        // Set some notices
+        S.error("foo", "Error")
+        S.warning("bar", "Warning")
+        S.notice("foo", "Notice")
+
+        // We reparse due to inconsistencies with UnparsedAttributes
+        val result = S.withAttrs(new UnprefixedAttribute("id", Text("foo"), new UnprefixedAttribute("noticeClass", Text("funky"), Null))) {
+          Msg.render(<div/>).toString // render this first so attrs get captured
+          LiftRules.noticesToJsCmd().toString.replace("\n", "")
+        }
+
+        result must_== """JsCmd(jQuery('#'+"foo").html("Error, <span class=\"funky\">Notice</span>");jQuery('#'+"bar").html("Warning");)"""
+      }
     }
   }
 }

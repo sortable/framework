@@ -33,8 +33,7 @@ import net.liftweb.record.field._
 import net.liftweb.proto.{ProtoUser => GenProtoUser}
 
 /**
- * ProtoUser is a base class that gives you a "User" that has a first name,
- * last name, email, etc.
+ * ProtoUser provides a "User" with a first name, last name, email, etc.
  */
 trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   self: T =>
@@ -77,7 +76,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   /**
    * The string name for the first name field
    */
-  def firstNameDisplayName = ??("first.name")
+  def firstNameDisplayName = S.?("first.name")
 
   /**
    * The last field for the User.  You can override the behavior
@@ -98,7 +97,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   /**
    * The last name string
    */
-  def lastNameDisplayName = ??("last.name")
+  def lastNameDisplayName = S.?("last.name")
 
   /**
    * The email field for the User.  You can override the behavior
@@ -112,7 +111,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   lazy val email: EmailField[T] = new MyEmail(this, 48)
 
   protected class MyEmail(obj: T, size: Int) extends EmailField(obj, size) {
-    override def validations = valUnique(S.??("unique.email.address")) _ :: super.validations
+    override def validations = valUnique(S.?("unique.email.address")) _ :: super.validations
     override def displayName = owner.emailDisplayName
     override val fieldId = Some(Text("txtEmail"))
   }
@@ -122,7 +121,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   /**
    * The email first name
    */
-  def emailDisplayName = ??("email.address")
+  def emailDisplayName = S.?("email.address")
 
   /**
    * The password field for the User.  You can override the behavior
@@ -142,7 +141,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
   /**
    * The display name for the password field
    */
-  def passwordDisplayName = ??("password")
+  def passwordDisplayName = S.?("password")
 
   /**
    * The superuser field for the User.  You can override the behavior
@@ -177,7 +176,7 @@ trait ProtoUser[T <: ProtoUser[T]] extends Record[T] {
 }
 
 /**
- * Mix this trait into the the Mapper singleton for User and you
+ * Mix this trait into the Mapper singleton for User and you
  * get a bunch of user functionality including password reset, etc.
  */
 trait MetaMegaProtoUser[ModelType <: MegaProtoUser[ModelType]] extends MetaRecord[ModelType] with GenProtoUser {
@@ -203,7 +202,7 @@ trait MetaMegaProtoUser[ModelType <: MegaProtoUser[ModelType]] extends MetaRecor
     def displayHtml: NodeSeq = from.displayHtml
 
     /**
-     * Does this represent a pointer to a Password field
+     * Does this represent a pointer to a Password field?
      */
     def isPasswordField_? : Boolean = from match {
       case a: PasswordField[_] => true
@@ -366,7 +365,7 @@ trait MegaProtoUser[T <: MegaProtoUser[T]] extends ProtoUser[T] {
   }
 
   /**
-   * The has the user been validated.
+   * Whether the user has been validated.
    * You can override the behavior
    * of this field:
    * <pre name="code" class="scala">
@@ -419,12 +418,11 @@ trait MegaProtoUser[T <: MegaProtoUser[T]] extends ProtoUser[T] {
   /**
    * The string for the timezone field
    */
-  def timezoneDisplayName = ??("time.zone")
+  def timezoneDisplayName = S.?("time.zone")
 
   /**
    * The string for the locale field
    */
-  def localeDisplayName = ??("locale")
+  def localeDisplayName = S.?("locale")
 
 }
-
