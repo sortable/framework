@@ -2,7 +2,7 @@ import Dependencies._
 
 organization in ThisBuild          := "net.liftweb"
 
-version in ThisBuild :=  "2.6.2"
+version in ThisBuild :=  "2.6-sortable1"
 
 homepage in ThisBuild              := Some(url("http://www.liftweb.net"))
 
@@ -12,7 +12,7 @@ startYear in ThisBuild             := Some(2006)
 
 organizationName in ThisBuild      := "WorldWide Conferencing, LLC"
 
-scalaVersion in ThisBuild          := "2.10.4"
+scalaVersion in ThisBuild          := "2.11.1"
 
 crossScalaVersions in ThisBuild    := Seq("2.11.1", "2.10.4", "2.9.2", "2.9.1-1", "2.9.1")
 
