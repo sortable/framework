@@ -588,7 +588,7 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
     def ? = this.box openOr false
   }
 
-  private val nmessageCallback: ConcurrentHashMap[String, S.AFuncHolder] = new ConcurrentHashMap
+  val nmessageCallback: ConcurrentHashMap[String, S.AFuncHolder] = new ConcurrentHashMap
 
   private val msgCallbackSync = new Object
 
