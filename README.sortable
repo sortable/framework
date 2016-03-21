@@ -10,7 +10,7 @@ A slightly tweaked version of Lift for use in Sortable webapps.
     > package lift-webkit
     > publish-local
     > exit
-    $ s3cmd put ~/.ivy2/local/net.liftweb/lift-webkit_2.11/VERSION/{jars,poms}/* s3://snapsort-maven-repo/snapshots/net/liftweb/lift-webkit_2.11/VERSION/
+    $ for f in ~/.ivy2/local/net.liftweb/lift-webkit_2.11/VERSION/{jars,poms}/*; do s3cmd put "$f" s3://snapsort-maven-repo/snapshots/net/liftweb/lift-webkit_2.11/VERSION/$(basename "${f/2.11/2.11-VERSION}"); done
 
 where VERSION is whatever it should be.  (See `build.sbt`.)
 
