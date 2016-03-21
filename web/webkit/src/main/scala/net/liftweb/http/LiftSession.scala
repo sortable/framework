@@ -902,34 +902,34 @@ class LiftSession(private[http] val _contextPath: String, val uniqueId: String,
   }
 
   def cleanupUnseenFuncs(): Unit = {
-    if (LiftRules.enableLiftGC && stateful_?) {
+    if (stateful_?) {
       val now = millis
+      if (LiftRules.enableLiftGC) {
+        accessPostPageFuncs {
+          for {
+            (key, pageInfo) <- postPageFunctions
+          } if (!pageInfo.longLife &&
+            (now - pageInfo.lastSeen) > LiftRules.unusedFunctionsLifeTime) {
+            postPageFunctions -= key
+          }
+        }
 
-      accessPostPageFuncs {
-        for {
-          (key, pageInfo) <- postPageFunctions
-        } if (!pageInfo.longLife &&
-          (now - pageInfo.lastSeen) > LiftRules.unusedFunctionsLifeTime) {
-          postPageFunctions -= key
+        withAjaxRequests { currentAjaxRequests =>
+          for {
+            (version, requestInfos) <- currentAjaxRequests
+          } {
+            val remaining =
+              requestInfos.filter { info =>
+                (now - info.lastSeen) <= LiftRules.unusedFunctionsLifeTime
+              }
+
+            if (remaining.length > 0)
+              currentAjaxRequests += (version -> remaining)
+            else
+              currentAjaxRequests -= version
+          }
         }
       }
-
-      withAjaxRequests { currentAjaxRequests =>
-        for {
-          (version, requestInfos) <- currentAjaxRequests
-        } {
-          val remaining =
-            requestInfos.filter { info =>
-              (now - info.lastSeen) <= LiftRules.unusedFunctionsLifeTime
-            }
-
-          if (remaining.length > 0)
-            currentAjaxRequests += (version -> remaining)
-          else
-            currentAjaxRequests -= version
-        }
-      }
-
 
       import scala.collection.JavaConversions._
       nmessageCallback.foreach {
