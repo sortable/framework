@@ -1,0 +1,25 @@
+# What it is
+
+A slightly tweaked version of Lift for use in Sortable webapps.
+
+# How to build it
+
+    $ git clone https://github.com/sortable/framework
+    $ cd framework
+    $ sbt
+    > package lift-webkit
+    > publish-local
+    > exit
+    $ s3cmd put ~/.ivy2/local/net.liftweb/lift-webkit_2.11/VERSION/{jars,poms}/* s3://snapsort-maven-repo/snapshots/net/liftweb/lift-webkit_2.11/VERSION/
+
+where VERSION is whatever it should be.  (See `build.sbt`.)
+
+# How to change it
+
+Make your changes on the `sortable` branch.
+
+Bump the version in `build.sbt` for every change that you intend to
+put in the repo on s3.
+
+Once your new version is in the s3 repo, update tng's `pom.xml` and
+`project/Build.scala` to specify that version.
